@@ -7,30 +7,30 @@ class AFSK1200Demodulator:
         self.fs = sample_rate
         self.baud = 1200.0
         
-        # --- NEUE STRATEGIE: MARK/SPACE FILTER (Besser bei Rauschen) ---
-        # Anstatt Frequenzänderung zu messen, filtern wir gezielt
-        # nach 1200 Hz und 2200 Hz und vergleichen die Lautstärke.
+        # --- FILTER DESIGN (Mark/Space Korrelator) ---
+        # Strategie: Wir filtern gezielt die zwei Frequenzen heraus
+        # und vergleichen deren Energie. Das ist robuster als FM-Demodulation.
         
-        # Filter für "Mark" (1200 Hz) - Sehr schmalbandig
+        # Filter für "Mark" (1200 Hz) - Logisch 1
         self.b_mark, self.a_mark = butter(2, [1100, 1300], btype='band', fs=self.fs)
         
-        # Filter für "Space" (2200 Hz) - Sehr schmalbandig
+        # Filter für "Space" (2200 Hz) - Logisch 0
         self.b_space, self.a_space = butter(2, [2100, 2300], btype='band', fs=self.fs)
         
-        # Tiefpass für das Datensignal (Post-Detection)
+        # Tiefpass für das Ergebnissignal (Post-Detection Filter)
         self.b_lp, self.a_lp = butter(2, 600, btype='low', fs=self.fs)
         
-        # Filter Status-Speicher
+        # Filter Status-Speicher (verhindert Knacksen zwischen Audio-Chunks)
         self.zi_mark = np.zeros((max(len(self.a_mark), len(self.b_mark)) - 1, ))
         self.zi_space = np.zeros((max(len(self.a_space), len(self.b_space)) - 1, ))
         self.zi_lp = np.zeros((max(len(self.a_lp), len(self.b_lp)) - 1, ))
 
-        # PLL State
+        # PLL (Clock Recovery) State
         self.pll_phase = 0.0
         self.pll_step = self.baud / self.fs
         self.last_phase = 0
         
-        # HDLC State
+        # HDLC (Packet Assembly) State
         self.packet_buffer = bytearray()
         self.ones_in_row = 0
         self.collecting = False
@@ -38,6 +38,10 @@ class AFSK1200Demodulator:
         self.bit_count = 0
         
     def process_chunk(self, audio_chunk):
+        """
+        Verarbeitet Audio und gibt Pakete zurück.
+        Return: (Liste_von_Bytes, Visualisierungs_Daten)
+        """
         if len(audio_chunk) == 0: return [], np.zeros(100)
 
         # 1. Audio Normalisieren
@@ -45,26 +49,23 @@ class AFSK1200Demodulator:
         if max_val == 0: return [], np.zeros(100)
         signal = audio_chunk / 32768.0
         
-        # 2. MARK / SPACE FILTERUNG
-        # Wir schicken das Signal durch ZWEI Filter parallel
+        # 2. MARK / SPACE FILTERUNG (Parallel)
         mark_sig, self.zi_mark = lfilter(self.b_mark, self.a_mark, signal, zi=self.zi_mark)
         space_sig, self.zi_space = lfilter(self.b_space, self.a_space, signal, zi=self.zi_space)
         
-        # 3. ENVELOPE DETECTION (Betrag bilden)
-        # Wir wollen wissen: Wo ist mehr Energie?
+        # 3. ENVELOPE (Betrag bilden)
         mark_env = np.abs(mark_sig)
         space_env = np.abs(space_sig)
         
-        # 4. SUBTRAKTION
-        # Mark - Space. 
-        # Positiv = 1200Hz (Bit 1), Negativ = 2200Hz (Bit 0)
+        # 4. SUBTRAKTION (Entscheidung)
+        # Positiv = Mehr 1200Hz Energie (Mark)
+        # Negativ = Mehr 2200Hz Energie (Space)
         raw_bits = mark_env - space_env
         
-        # 5. TIEFPASS (Glättung)
+        # 5. GLÄTTUNG
         demodulated, self.zi_lp = lfilter(self.b_lp, self.a_lp, raw_bits, zi=self.zi_lp)
         
-        # 6. BIT SLICING (Digitalisierung)
-        # Hysterese: Signal muss deutlich positiv/negativ sein
+        # 6. DIGITALISIERUNG
         bits_digital = (demodulated > 0.0).astype(int)
         
         # 7. CLOCK RECOVERY & HDLC
@@ -91,9 +92,11 @@ class AFSK1200Demodulator:
         return packets, demodulated
 
     def _hdlc_process(self, bit):
+        # Erkennt Flags (01111110) und entfernt Bit-Stuffing
         if bit == 0 and self.ones_in_row == 6: # Flag
             result = None
             if len(self.packet_buffer) > 14: 
+                # CRC entfernen (letzte 2 Bytes)
                 result = bytes(self.packet_buffer[:-2]) 
             self.packet_buffer = bytearray()
             self.bit_buffer = 0
@@ -102,13 +105,13 @@ class AFSK1200Demodulator:
             self.collecting = True
             return result
             
-        if bit == 0 and self.ones_in_row == 5: # Stuffing
+        if bit == 0 and self.ones_in_row == 5: # Bit Stuffing
             self.ones_in_row = 0
             return None
             
         if bit == 1:
             self.ones_in_row += 1
-            if self.ones_in_row > 6: # Error
+            if self.ones_in_row > 6: # Fehler
                 self.packet_buffer = bytearray()
                 self.collecting = False
                 self.ones_in_row = 0
@@ -123,6 +126,7 @@ class AFSK1200Demodulator:
                 self.packet_buffer.append(self.bit_buffer)
                 self.bit_buffer = 0
                 self.bit_count = 0
+                # Schutz gegen Speicherüberlauf
                 if len(self.packet_buffer) > 300: 
                     self.collecting = False
                     self.packet_buffer = bytearray()
@@ -149,6 +153,7 @@ class APRSPacket:
             self.callsign_dst = self._decode_call(data[0:7])
             self.callsign_src = self._decode_call(data[7:14])
             try:
+                # Suche nach PID 0xF0 (APRS Data)
                 idx = data.index(b'\x03\xf0') 
                 self.payload = data[idx+2:].decode('latin-1', errors='replace')
                 self._parse_aprs_data(self.payload)
@@ -168,7 +173,7 @@ class APRSPacket:
 
     def _parse_aprs_data(self, info):
         import re
-        # Extrahiert Position UND Symbole
+        # Extrahiert Position (Lat/Lon) UND Symbole
         pattern = re.compile(r'[\!=\/@](\d{4}\.\d{2})([NS])(.)(\d{5}\.\d{2})([EW])(.)')
         match = pattern.search(info)
         if match:
