@@ -1,18 +1,16 @@
 import json
 import os
-import tkinter as tk
-from tkinter import ttk
 
 CONFIG_FILE = "config.json"
 
-# --- LANGUAGE PACKS ---
+# --- LANGUAGES ---
 LANGUAGES = {
     "English": {
         "WINDOW_TITLE": "APRS DECODER - U96 EDITION",
         "AUDIO_INPUT": "Audio Input Device",
         "START": "Start Receiver",
         "STOP": "Stop Receiver",
-        "STATUS_READY": "System Ready - Standby",
+        "STATUS_READY": "System Ready",
         "STATUS_LISTENING": "Listening on 144.800 MHz (UTC)",
         "SCOPE_TITLE": "Signal Analysis",
         "MAP_TITLE": "Tactical Map",
@@ -23,31 +21,31 @@ LANGUAGES = {
         "COL_MSG": "Message",
         "BTN_SETTINGS": "Settings",
         "BTN_SAVE_LOG": "Save Log (CSV)",
-        "SETTINGS_TITLE": "Configuration",
         "LBL_THEME": "Visual Theme:",
         "LBL_LANG": "Language:",
-        "BTN_SAVE": "Apply & Close"
+        "LBL_AUDIO": "Audio Device:",
+        "BTN_CLOSE_SETT": "Save & Close"
     },
     "Deutsch": {
         "WINDOW_TITLE": "APRS DECODER - U96 EDITION",
         "AUDIO_INPUT": "Audio Eingabegerät",
-        "START": "Empfänger Starten",
-        "STOP": "Empfänger Stoppen",
-        "STATUS_READY": "System Bereit",
+        "START": "Starten",
+        "STOP": "Stoppen",
+        "STATUS_READY": "Bereit",
         "STATUS_LISTENING": "Empfange auf 144.800 MHz (UTC)",
         "SCOPE_TITLE": "Signal Analyse",
         "MAP_TITLE": "Taktische Karte",
-        "LOG_TITLE": "Stations-Logbuch",
+        "LOG_TITLE": "Logbuch",
         "COL_TIME": "Zeit (UTC)",
         "COL_CALL": "Rufzeichen",
         "COL_SYM": "Symbol",
         "COL_MSG": "Nachricht",
         "BTN_SETTINGS": "Einstellungen",
-        "BTN_SAVE_LOG": "Log Speichern (CSV)",
-        "SETTINGS_TITLE": "Konfiguration",
+        "BTN_SAVE_LOG": "Log Speichern",
         "LBL_THEME": "Design Thema:",
         "LBL_LANG": "Sprache:",
-        "BTN_SAVE": "Übernehmen & Schließen"
+        "LBL_AUDIO": "Audio Gerät:",
+        "BTN_CLOSE_SETT": "Speichern & Schließen"
     }
 }
 
@@ -84,18 +82,26 @@ class SettingsManager:
         self.config = self.load_config()
         
     def load_config(self):
-        default = {"theme": "Windows (Default)", "language": "English"}
+        default = {
+            "theme": "Windows (Default)", 
+            "language": "English",
+            "audio_device_index": 0
+        }
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, "r") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    # Merge with defaults to prevent errors on new keys
+                    default.update(data)
+                    return default
             except:
                 return default
         return default
 
-    def save_config(self, theme, lang):
+    def save_config(self, theme, lang, audio_idx):
         self.config["theme"] = theme
         self.config["language"] = lang
+        self.config["audio_device_index"] = audio_idx
         with open(CONFIG_FILE, "w") as f:
             json.dump(self.config, f)
 
@@ -106,60 +112,3 @@ class SettingsManager:
     def get_style(self):
         theme_name = self.config.get("theme", "Windows (Default)")
         return THEMES.get(theme_name, THEMES["Windows (Default)"])
-
-class SettingsWindow:
-    def __init__(self, parent, manager, apply_callback):
-        self.window = tk.Toplevel(parent)
-        self.manager = manager
-        self.apply_callback = apply_callback # Funktion zum Live-Update
-        self.txt = manager.get_text
-        
-        # Fenster Konfiguration (Modal/Transient)
-        self.window.title(self.txt("SETTINGS_TITLE"))
-        self.window.geometry("400x300")
-        self.window.resizable(False, False)
-        
-        # Zentrieren relativ zum Hauptfenster
-        x = parent.winfo_x() + 50
-        y = parent.winfo_y() + 50
-        self.window.geometry(f"+{x}+{y}")
-        
-        # Macht das Fenster zu einem Teil des Hauptfensters (kein eigener Taskbar Eintrag)
-        self.window.transient(parent)
-        # Fokus festhalten (Modal)
-        self.window.grab_set()
-        
-        style = manager.get_style()
-        self.window.configure(bg=style["bg"])
-        
-        frame = tk.Frame(self.window, bg=style["bg"], padx=20, pady=20)
-        frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Language
-        lbl_lang = tk.Label(frame, text=self.txt("LBL_LANG"), bg=style["bg"], fg=style["fg"], font=style["font_bold"])
-        lbl_lang.pack(anchor=tk.W, pady=(0, 5))
-        
-        self.var_lang = tk.StringVar(value=manager.config["language"])
-        cb_lang = ttk.Combobox(frame, textvariable=self.var_lang, values=list(LANGUAGES.keys()), state="readonly")
-        cb_lang.pack(fill=tk.X, pady=(0, 15))
-        
-        # Theme
-        lbl_theme = tk.Label(frame, text=self.txt("LBL_THEME"), bg=style["bg"], fg=style["fg"], font=style["font_bold"])
-        lbl_theme.pack(anchor=tk.W, pady=(0, 5))
-        
-        self.var_theme = tk.StringVar(value=manager.config["theme"])
-        cb_theme = ttk.Combobox(frame, textvariable=self.var_theme, values=list(THEMES.keys()), state="readonly")
-        cb_theme.pack(fill=tk.X, pady=(0, 20))
-        
-        # Save Button
-        btn_save = tk.Button(frame, text=self.txt("BTN_SAVE"), command=self.save, 
-                           bg=style["panel"], fg=style["fg"])
-        btn_save.pack(pady=10)
-        
-    def save(self):
-        # Speichern
-        self.manager.save_config(self.var_theme.get(), self.var_lang.get())
-        # Callback aufrufen (Live Update in main.py)
-        self.apply_callback()
-        # Fenster schließen
-        self.window.destroy()

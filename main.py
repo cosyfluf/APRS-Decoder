@@ -12,44 +12,53 @@ from datetime import datetime
 
 # Import Logic and Settings
 from decoder import AFSK1200Demodulator, APRSPacket
-from settings import SettingsManager, SettingsWindow
+from settings import SettingsManager
 from icon.icon_manager import IconManager
 
 class APRSApp:
     def __init__(self, root):
         self.root = root
         
-        # 1. Settings Init
+        # 1. Load Managers
         self.settings = SettingsManager()
-        
-        # 2. Logic Init
         self.demod = AFSK1200Demodulator()
         self.icon_mgr = IconManager()
         self.p = pyaudio.PyAudio()
+        
+        # 2. State
         self.is_running = False
         self.audio_queue = queue.Queue()
-        
         self.markers = {}         
         self.marker_data = {}     
         self.active_marker_call = None
-        
         self.paths = {}           
         self.station_history = {} 
         self.log_data = []        
         
-        # Variables that need text update
         self.status_var = tk.StringVar()
         
-        # 3. Setup UI Structure (Empty/Default)
-        self.setup_ui_structure()
+        # 3. Audio Devices
+        self.audio_devices = self.get_audio_devices()
         
-        # 4. Apply Initial Theme & Language
+        # 4. Build UI
+        self.setup_ui_structure()
         self.reload_ui()
         
-        self.update_devices()
+        # FORCE GEOMETRY (Verhindert das Zusammenfallen des Fensters)
+        self.root.geometry("1200x900")
+        self.root.update() 
+
+    def get_audio_devices(self):
+        devs = []
+        try:
+            for i in range(self.p.get_device_count()):
+                d = self.p.get_device_info_by_index(i)
+                if d['maxInputChannels'] > 0: 
+                    devs.append(f"{i}: {d['name']}")
+        except: pass
+        return devs
 
     def setup_ui_structure(self):
-        """Erstellt nur die Widgets, Farben/Texte kommen später"""
         # --- Toolbar ---
         self.toolbar = ttk.Frame(self.root)
         self.toolbar.pack(fill=tk.X, padx=5, pady=5)
@@ -57,80 +66,102 @@ class APRSApp:
         self.btn_save = ttk.Button(self.toolbar, command=self.save_log)
         self.btn_save.pack(side=tk.LEFT)
         
-        self.btn_sett = ttk.Button(self.toolbar, command=self.open_settings)
+        self.btn_sett = ttk.Button(self.toolbar, command=self.toggle_settings_view)
         self.btn_sett.pack(side=tk.RIGHT)
-
-        # --- SCOPE ---
-        self.scope_frame = ttk.LabelFrame(self.root, padding=2)
-        self.scope_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        self.scope_canvas = tk.Canvas(self.scope_frame, height=150, highlightthickness=0)
+        self.btn_start = ttk.Button(self.toolbar, command=self.toggle_receiving)
+        self.btn_start.pack(side=tk.RIGHT, padx=10)
+
+        # --- CONTAINER ---
+        self.container = ttk.Frame(self.root)
+        self.container.pack(fill=tk.BOTH, expand=True)
+        
+        # === VIEW 1: DASHBOARD ===
+        # FIX: Hier nutzen wir jetzt pack() statt place()!
+        # Das zwingt den Container, sich aufzupumpen.
+        self.view_dashboard = ttk.Frame(self.container)
+        self.view_dashboard.pack(fill=tk.BOTH, expand=True)
+        
+        # Scope
+        self.scope_frame = ttk.LabelFrame(self.view_dashboard, padding=2)
+        self.scope_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.scope_canvas = tk.Canvas(self.scope_frame, height=120, highlightthickness=0)
         self.scope_canvas.pack(fill=tk.BOTH, expand=True)
 
-        # --- MAIN PANEL ---
-        self.paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        # Split Pane
+        self.paned = ttk.PanedWindow(self.view_dashboard, orient=tk.HORIZONTAL)
         self.paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
-        # --- LEFT SIDE ---
-        self.left_panel = ttk.Frame(self.paned, width=400)
-        self.paned.add(self.left_panel, weight=1)
-        
-        # Audio
-        self.ctrl_group = ttk.LabelFrame(self.left_panel, padding=10)
-        self.ctrl_group.pack(fill=tk.X, pady=(0, 10))
-        
-        self.device_combo = ttk.Combobox(self.ctrl_group)
-        self.device_combo.pack(fill=tk.X, pady=5)
-        
-        self.btn_start = ttk.Button(self.ctrl_group, command=self.toggle_receiving)
-        self.btn_start.pack(fill=tk.X, pady=5)
-        
-        # Log
-        self.log_group = ttk.LabelFrame(self.left_panel, padding=2)
-        self.log_group.pack(fill=tk.BOTH, expand=True)
+        # Log (Left)
+        self.log_group = ttk.LabelFrame(self.paned, padding=2)
+        self.paned.add(self.log_group, weight=1)
         
         cols = ("Time", "Call", "Sym", "Data")
         self.tree = ttk.Treeview(self.log_group, columns=cols, show='headings', selectmode='browse')
-        
         self.tree.column("Time", width=70, anchor="center")
         self.tree.column("Call", width=90, anchor="w")
         self.tree.column("Sym", width=50, anchor="center")
-        
         self.scrl = ttk.Scrollbar(self.log_group, command=self.tree.yview)
         self.tree.configure(yscroll=self.scrl.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.scrl.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.bind('<<TreeviewSelect>>', self.on_list_select)
         
-        self.lbl_status = tk.Label(self.left_panel, textvariable=self.status_var, 
-                                 bd=2, relief=tk.SUNKEN, anchor=tk.W, padx=5)
-        self.lbl_status.pack(fill=tk.X, side=tk.BOTTOM, pady=5)
-
-        # --- RIGHT SIDE (MAP) ---
+        # Map (Right)
         self.map_container = ttk.LabelFrame(self.paned)
         self.paned.add(self.map_container, weight=3)
-        
         self.map_widget = tkintermapview.TkinterMapView(self.map_container, corner_radius=0)
         self.map_widget.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         self.map_widget.set_position(51.16, 10.45)
         self.map_widget.set_zoom(6)
+        
+        # Status
+        self.lbl_status = tk.Label(self.view_dashboard, textvariable=self.status_var, bd=2, relief=tk.SUNKEN, anchor=tk.W, padx=5)
+        self.lbl_status.pack(fill=tk.X, side=tk.BOTTOM, pady=5)
+
+        # === VIEW 2: SETTINGS (Hidden Overlay) ===
+        # Dies bleibt hidden und wird bei Bedarf "placed" (drübergelegt)
+        self.view_settings = ttk.Frame(self.container)
+        
+        self.sett_box = ttk.Frame(self.view_settings, padding=20)
+        self.sett_box.place(relx=0.5, rely=0.5, anchor="center", width=500, height=450)
+        
+        ttk.Label(self.sett_box, text="SETTINGS", font=("Consolas", 16, "bold")).pack(pady=20)
+        
+        # Settings Fields
+        ttk.Label(self.sett_box, text="Language:").pack(anchor=tk.W)
+        self.var_lang = tk.StringVar()
+        self.cb_lang = ttk.Combobox(self.sett_box, textvariable=self.var_lang, state="readonly")
+        self.cb_lang.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(self.sett_box, text="Theme:").pack(anchor=tk.W, pady=(10,0))
+        self.var_theme = tk.StringVar()
+        self.cb_theme = ttk.Combobox(self.sett_box, textvariable=self.var_theme, state="readonly")
+        self.cb_theme.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(self.sett_box, text="Audio Input:").pack(anchor=tk.W, pady=(10,0))
+        self.var_audio = tk.StringVar()
+        self.cb_audio = ttk.Combobox(self.sett_box, textvariable=self.var_audio, values=self.audio_devices, state="readonly")
+        self.cb_audio.pack(fill=tk.X, pady=5)
+        
+        self.btn_close_sett = ttk.Button(self.sett_box, command=self.save_settings)
+        self.btn_close_sett.pack(pady=30, fill=tk.X)
 
     def reload_ui(self):
-        """Lädt Styles und Texte neu, ohne Neustart"""
+        """Refreshes Colors, Texts and States"""
         self.style_cfg = self.settings.get_style()
         self.txt = self.settings.get_text
         cfg = self.style_cfg
         
-        # 1. Hauptfenster Farben
         self.root.configure(bg=cfg["bg"])
         self.root.title(self.txt("WINDOW_TITLE"))
+        # Settings view background needs to match theme
+        self.view_settings.configure(style="TFrame") 
+        self.view_dashboard.configure(style="TFrame")
         
-        # 2. TTK Style Update
         s = ttk.Style()
-        try:
-            s.theme_use(cfg["ttk_theme"])
+        try: s.theme_use(cfg["ttk_theme"])
         except: pass
-        
         s.configure(".", background=cfg["bg"], foreground=cfg["fg"], font=cfg["font"], borderwidth=1)
         s.configure("TFrame", background=cfg["bg"])
         s.configure("TLabelframe", background=cfg["bg"], bordercolor=cfg["accent"])
@@ -141,21 +172,18 @@ class APRSApp:
         s.configure("Treeview", background=cfg["panel"], fieldbackground=cfg["panel"], foreground=cfg["fg"], borderwidth=0, font=cfg["font"])
         s.configure("Treeview.Heading", background=cfg["grid"], foreground=cfg["fg"], font=cfg["font_bold"])
         s.map("Treeview", background=[('selected', cfg["accent"])], foreground=[('selected', 'white')])
-        s.configure("Vertical.TScrollbar", background=cfg["panel"], troughcolor=cfg["bg"])
         
-        # 3. Widget Texte & Farben (Manuelles Update für non-ttk)
         self.btn_save.config(text=self.txt("BTN_SAVE_LOG"))
         self.btn_sett.config(text=self.txt("BTN_SETTINGS"))
+        self.btn_close_sett.config(text=self.txt("BTN_CLOSE_SETT"))
         
         self.scope_frame.config(text=self.txt("SCOPE_TITLE"))
         self.scope_canvas.config(bg=cfg["scope_bg"])
-        self.draw_grid() # Grid Farbe updaten
+        self.draw_grid()
         
-        self.ctrl_group.config(text=self.txt("AUDIO_INPUT"))
         self.log_group.config(text=self.txt("LOG_TITLE"))
         self.map_container.config(text=self.txt("MAP_TITLE"))
         
-        # Button Text Toggle Status beachten
         if self.is_running:
             self.btn_start.config(text=self.txt("STOP"))
             self.status_var.set(self.txt("STATUS_LISTENING"))
@@ -163,22 +191,52 @@ class APRSApp:
             self.btn_start.config(text=self.txt("START"))
             self.status_var.set(self.txt("STATUS_READY"))
             
-        # Treeview Headers
         self.tree.heading("Time", text=self.txt("COL_TIME"))
         self.tree.heading("Call", text=self.txt("COL_CALL"))
         self.tree.heading("Sym", text=self.txt("COL_SYM"))
         self.tree.heading("Data", text=self.txt("COL_MSG"))
         self.tree.tag_configure('matrix', foreground=cfg["fg"], background=cfg["panel"])
         
-        # Status Label (Non-TTK)
         self.lbl_status.config(bg=cfg["scope_bg"], fg=cfg["scope_fg"], font=cfg["font_bold"])
-        
-        # Map Tile Server Update
         self.map_widget.set_tile_server(cfg["map_server"])
+        
+        # Populate Settings
+        from settings import LANGUAGES, THEMES
+        self.cb_lang['values'] = list(LANGUAGES.keys())
+        self.cb_theme['values'] = list(THEMES.keys())
+        
+        self.var_lang.set(self.settings.config["language"])
+        self.var_theme.set(self.settings.config["theme"])
+        
+        idx = self.settings.config.get("audio_device_index", 0)
+        if idx < len(self.audio_devices):
+            self.var_audio.set(self.audio_devices[idx])
+        elif self.audio_devices:
+            self.var_audio.set(self.audio_devices[0])
 
-    def open_settings(self):
-        # Übergibt self.reload_ui als Callback
-        SettingsWindow(self.root, self.settings, self.reload_ui)
+    def toggle_settings_view(self):
+        """Swaps between Dashboard and Settings"""
+        if self.view_settings.winfo_ismapped():
+            self.view_settings.place_forget()
+        else:
+            # Hier nutzen wir place, um es ÜBER das Dashboard zu legen
+            self.view_settings.place(relx=0, rely=0, relwidth=1, relheight=1)
+            self.view_settings.lift()
+
+    def save_settings(self):
+        sel_audio = self.var_audio.get()
+        audio_idx = 0
+        if sel_audio:
+            try: audio_idx = int(sel_audio.split(':')[0])
+            except: pass
+            
+        self.settings.save_config(self.var_theme.get(), self.var_lang.get(), audio_idx)
+        self.reload_ui()
+        self.view_settings.place_forget()
+        
+        if self.is_running:
+            self.toggle_receiving() 
+            self.root.after(500, self.toggle_receiving)
 
     def save_log(self):
         if not self.log_data:
@@ -204,21 +262,10 @@ class APRSApp:
         w = 1200 
         h = 150
         cfg = self.style_cfg
-        self.scope_canvas.delete("grid") # Altes Grid löschen
-        
+        self.scope_canvas.delete("grid") 
         self.scope_canvas.create_line(0, h/4, 2000, h/4, fill=cfg["grid"], dash=(2, 4), tags="grid")
         self.scope_canvas.create_line(0, h/2, 2000, h/2, fill=cfg["scope_line"], width=1, tags="grid")
         self.scope_canvas.create_line(0, 3*h/4, 2000, 3*h/4, fill=cfg["grid"], dash=(2, 4), tags="grid")
-
-    def update_devices(self):
-        devs = []
-        try:
-            for i in range(self.p.get_device_count()):
-                d = self.p.get_device_info_by_index(i)
-                if d['maxInputChannels'] > 0: devs.append(f"{i}: {d['name']}")
-        except: pass
-        self.device_combo['values'] = devs
-        if devs: self.device_combo.current(0)
 
     def on_list_select(self, event):
         sel = self.tree.selection()
@@ -231,8 +278,9 @@ class APRSApp:
     def toggle_receiving(self):
         if not self.is_running:
             try:
-                if not self.device_combo.get(): return
-                idx = int(self.device_combo.get().split(':')[0])
+                # Use configured audio index
+                idx = self.settings.config.get("audio_device_index", 0)
+                
                 self.stream = self.p.open(format=pyaudio.paInt16, channels=1, rate=22050,
                                         input=True, input_device_index=idx,
                                         frames_per_buffer=4096, stream_callback=self.audio_callback)
@@ -279,7 +327,7 @@ class APRSApp:
         if w < 10: return
         self.scope_canvas.delete("wave")
         
-        cfg = self.style_cfg # Nutze aktuelle Config
+        cfg = self.style_cfg
         step = max(1, len(audio) // w)
         mid1 = h / 4
         mid2 = (h / 4) * 3
