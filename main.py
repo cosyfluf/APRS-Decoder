@@ -44,7 +44,7 @@ class APRSApp:
         self.setup_ui_structure()
         self.reload_ui()
         
-        # FORCE GEOMETRY (Verhindert das Zusammenfallen des Fensters)
+        # Force geometry to prevent collapse
         self.root.geometry("1200x900")
         self.root.update() 
 
@@ -68,17 +68,12 @@ class APRSApp:
         
         self.btn_sett = ttk.Button(self.toolbar, command=self.toggle_settings_view)
         self.btn_sett.pack(side=tk.RIGHT)
-        
-        self.btn_start = ttk.Button(self.toolbar, command=self.toggle_receiving)
-        self.btn_start.pack(side=tk.RIGHT, padx=10)
 
         # --- CONTAINER ---
         self.container = ttk.Frame(self.root)
         self.container.pack(fill=tk.BOTH, expand=True)
         
         # === VIEW 1: DASHBOARD ===
-        # FIX: Hier nutzen wir jetzt pack() statt place()!
-        # Das zwingt den Container, sich aufzupumpen.
         self.view_dashboard = ttk.Frame(self.container)
         self.view_dashboard.pack(fill=tk.BOTH, expand=True)
         
@@ -92,9 +87,26 @@ class APRSApp:
         self.paned = ttk.PanedWindow(self.view_dashboard, orient=tk.HORIZONTAL)
         self.paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
-        # Log (Left)
-        self.log_group = ttk.LabelFrame(self.paned, padding=2)
-        self.paned.add(self.log_group, weight=1)
+        # --- LINKES PANEL ---
+        self.left_panel = ttk.Frame(self.paned, width=400)
+        self.paned.add(self.left_panel, weight=1)
+        
+        # 1. Audio Control
+        self.ctrl_group = ttk.LabelFrame(self.left_panel, padding=10)
+        self.ctrl_group.pack(fill=tk.X, pady=(0, 5))
+        
+        self.device_combo = ttk.Combobox(self.ctrl_group)
+        self.device_combo.pack(fill=tk.X, pady=5)
+        
+        # 2. START/STOP BUTTON (WICHTIG: tk.Button für Farben!)
+        # Platziert direkt zwischen Audio und Log
+        self.btn_start = tk.Button(self.left_panel, command=self.toggle_receiving, 
+                                 bd=0, relief=tk.FLAT, cursor="hand2")
+        self.btn_start.pack(fill=tk.X, pady=10, padx=2)
+        
+        # 3. Log
+        self.log_group = ttk.LabelFrame(self.left_panel, padding=2)
+        self.log_group.pack(fill=tk.BOTH, expand=True)
         
         cols = ("Time", "Call", "Sym", "Data")
         self.tree = ttk.Treeview(self.log_group, columns=cols, show='headings', selectmode='browse')
@@ -120,7 +132,6 @@ class APRSApp:
         self.lbl_status.pack(fill=tk.X, side=tk.BOTTOM, pady=5)
 
         # === VIEW 2: SETTINGS (Hidden Overlay) ===
-        # Dies bleibt hidden und wird bei Bedarf "placed" (drübergelegt)
         self.view_settings = ttk.Frame(self.container)
         
         self.sett_box = ttk.Frame(self.view_settings, padding=20)
@@ -128,7 +139,6 @@ class APRSApp:
         
         ttk.Label(self.sett_box, text="SETTINGS", font=("Consolas", 16, "bold")).pack(pady=20)
         
-        # Settings Fields
         ttk.Label(self.sett_box, text="Language:").pack(anchor=tk.W)
         self.var_lang = tk.StringVar()
         self.cb_lang = ttk.Combobox(self.sett_box, textvariable=self.var_lang, state="readonly")
@@ -155,7 +165,6 @@ class APRSApp:
         
         self.root.configure(bg=cfg["bg"])
         self.root.title(self.txt("WINDOW_TITLE"))
-        # Settings view background needs to match theme
         self.view_settings.configure(style="TFrame") 
         self.view_dashboard.configure(style="TFrame")
         
@@ -181,14 +190,28 @@ class APRSApp:
         self.scope_canvas.config(bg=cfg["scope_bg"])
         self.draw_grid()
         
+        self.ctrl_group.config(text=self.txt("AUDIO_INPUT"))
         self.log_group.config(text=self.txt("LOG_TITLE"))
         self.map_container.config(text=self.txt("MAP_TITLE"))
         
+        # --- UPDATE BUTTON FARBE & TEXT ---
+        # Wir nutzen Config Farben für konsistenten Look
+        # START = Grün (accent), STOP = Rot (warn)
         if self.is_running:
-            self.btn_start.config(text=self.txt("STOP"))
+            self.btn_start.config(
+                text=self.txt("STOP"), 
+                bg=cfg["warn"], 
+                fg="black" if "U96" in self.settings.config["theme"] else "white",
+                font=cfg["font_bold"]
+            )
             self.status_var.set(self.txt("STATUS_LISTENING"))
         else:
-            self.btn_start.config(text=self.txt("START"))
+            self.btn_start.config(
+                text=self.txt("START"), 
+                bg=cfg["accent"], 
+                fg="black" if "U96" in self.settings.config["theme"] else "white",
+                font=cfg["font_bold"]
+            )
             self.status_var.set(self.txt("STATUS_READY"))
             
         self.tree.heading("Time", text=self.txt("COL_TIME"))
@@ -215,11 +238,9 @@ class APRSApp:
             self.var_audio.set(self.audio_devices[0])
 
     def toggle_settings_view(self):
-        """Swaps between Dashboard and Settings"""
         if self.view_settings.winfo_ismapped():
             self.view_settings.place_forget()
         else:
-            # Hier nutzen wir place, um es ÜBER das Dashboard zu legen
             self.view_settings.place(relx=0, rely=0, relwidth=1, relheight=1)
             self.view_settings.lift()
 
@@ -276,17 +297,25 @@ class APRSApp:
                 self.map_widget.set_position(m.position[0], m.position[1])
 
     def toggle_receiving(self):
+        # Config laden für Farben
+        cfg = self.style_cfg
+        
         if not self.is_running:
             try:
-                # Use configured audio index
                 idx = self.settings.config.get("audio_device_index", 0)
-                
                 self.stream = self.p.open(format=pyaudio.paInt16, channels=1, rate=22050,
                                         input=True, input_device_index=idx,
                                         frames_per_buffer=4096, stream_callback=self.audio_callback)
                 self.is_running = True
-                self.btn_start.config(text=self.txt("STOP"))
+                
+                # --- UPDATE TO STOP (RED) ---
+                self.btn_start.config(
+                    text=self.txt("STOP"), 
+                    bg=cfg["warn"], 
+                    fg="black" if "U96" in self.settings.config["theme"] else "white"
+                )
                 self.status_var.set(self.txt("STATUS_LISTENING"))
+                
                 t = threading.Thread(target=self.processing_loop)
                 t.daemon = True
                 t.start()
@@ -297,7 +326,13 @@ class APRSApp:
             if hasattr(self, 'stream'):
                 self.stream.stop_stream()
                 self.stream.close()
-            self.btn_start.config(text=self.txt("START"))
+            
+            # --- UPDATE TO START (GREEN) ---
+            self.btn_start.config(
+                text=self.txt("START"), 
+                bg=cfg["accent"], 
+                fg="black" if "U96" in self.settings.config["theme"] else "white"
+            )
             self.status_var.set(self.txt("STATUS_READY"))
 
     def audio_callback(self, in_data, frame_count, time_info, status):
