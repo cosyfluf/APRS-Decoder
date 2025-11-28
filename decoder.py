@@ -1,5 +1,6 @@
 import numpy as np
 import datetime
+import re
 from scipy.signal import butter, lfilter
 
 class AFSK1200Demodulator:
@@ -8,27 +9,24 @@ class AFSK1200Demodulator:
         self.baud = 1200.0
         
         # --- ROBUST FILTER DESIGN ---
-        # Instead of narrow mark/space filters, we use a wide bandpass.
-        # This handles frequency drift better (e.g., poor radio calibration).
-        
         # 1. Bandpass: 900Hz - 2500Hz
-        # Removes low hum and high frequency noise.
+        # Filters out low hum and high frequency noise
         self.b_bp, self.a_bp = butter(4, [900, 2500], btype='band', fs=self.fs)
         
         # 2. Lowpass: 1200Hz
-        # Post-detection filter to smooth the discriminator output.
+        # Smoothing filter after demodulation
         self.b_lp, self.a_lp = butter(4, 1200, btype='low', fs=self.fs)
         
-        # Filter States (to maintain continuity between audio chunks)
+        # Filter states (for continuous stream processing)
         self.zi_bp = np.zeros((max(len(self.a_bp), len(self.b_bp)) - 1, ))
         self.zi_lp = np.zeros((max(len(self.a_lp), len(self.b_lp)) - 1, ))
 
-        # PLL (Clock Recovery) State
+        # PLL (Phase Locked Loop) State
         self.pll_phase = 0.0
         self.pll_step = self.baud / self.fs
         self.last_phase = 0
         
-        # HDLC (Packet Assembly) State
+        # HDLC (High-Level Data Link Control) State
         self.packet_buffer = bytearray()
         self.ones_in_row = 0
         self.collecting = False
@@ -37,59 +35,50 @@ class AFSK1200Demodulator:
         
     def process_chunk(self, audio_chunk):
         """
-        Process audio chunk, demodulate and return parsed packets.
-        Returns: (List_of_Packet_Bytes, Demodulated_Signal_For_UI)
+        Demodulates audio chunk and extracts AX.25 packets.
         """
-        # Safety check for empty data
-        if len(audio_chunk) == 0: 
-            return [], np.zeros(100)
+        if len(audio_chunk) == 0: return [], np.zeros(100)
 
-        # 1. Normalize (prevent clipping, convert to float -1.0 to 1.0)
         max_val = np.max(np.abs(audio_chunk))
-        if max_val == 0: 
-            return [], np.zeros(100)
+        if max_val == 0: return [], np.zeros(100)
             
+        # Normalize audio to -1.0 ... 1.0
         signal = audio_chunk / 32768.0
         
-        # 2. BANDPASS FILTER
+        # 1. Bandpass Filter
         signal_filtered, self.zi_bp = lfilter(self.b_bp, self.a_bp, signal, zi=self.zi_bp)
         
-        # 3. HARD LIMITER (Crucial!)
-        # Converts everything to a square wave (+1/-1).
-        # Makes the decoder immune to volume fluctuations.
+        # 2. Hard Limiter (Amplifies weak signals to square wave)
         signal_limited = np.sign(signal_filtered)
         
-        # 4. DISCRIMINATOR (Delay-Line)
-        # Classic FM Demodulation by multiplying signal with delayed version.
+        # 3. Delay-Line Discriminator (FM Demodulation)
         delayed = np.roll(signal_limited, 1)
         delayed[0] = 0 
         mixed = signal_limited * delayed
         
-        # 5. LOWPASS FILTER (Smoothing)
+        # 4. Lowpass Filter
         demodulated, self.zi_lp = lfilter(self.b_lp, self.a_lp, mixed, zi=self.zi_lp)
         
-        # 6. BIT SLICING
-        # Use mean as threshold (DC Offset Removal)
+        # 5. Bit Slicing (Decision: 0 or 1)
         threshold = np.mean(demodulated)
         bits_digital = (demodulated > threshold).astype(int)
         
-        # 7. CLOCK RECOVERY & HDLC
+        # 6. Clock Recovery & HDLC Decoding
         packets = []
         for i in range(1, len(bits_digital)):
             self.pll_phase += self.pll_step
             
-            # Sync PLL on edge detection
+            # Sync PLL on edge
             if bits_digital[i] != bits_digital[i-1]:
-                # Nudge PLL
                 if self.pll_phase < 0.5: self.pll_phase += 0.05
                 else: self.pll_phase -= 0.05
             
-            # Sampling point
+            # Sample bit
             if self.pll_phase >= 1.0:
                 self.pll_phase -= 1.0
                 sampled_bit = bits_digital[i]
                 
-                # NRZI Decoding: Change = 0, No Change = 1
+                # NRZI Decoding
                 current_bit = 1 if sampled_bit == self.last_phase else 0
                 self.last_phase = sampled_bit
                 
@@ -99,10 +88,10 @@ class AFSK1200Demodulator:
         return packets, demodulated
 
     def _hdlc_process(self, bit):
-        # Detect Flag (01111110)
+        # Flag Detection (01111110)
         if bit == 0 and self.ones_in_row == 6: 
             result = None
-            if len(self.packet_buffer) > 14: # Min length for APRS
+            if len(self.packet_buffer) > 14: 
                 # Strip CRC (last 2 bytes)
                 result = bytes(self.packet_buffer[:-2]) 
             self.packet_buffer = bytearray()
@@ -112,7 +101,7 @@ class AFSK1200Demodulator:
             self.collecting = True
             return result
             
-        # Remove Bit Stuffing (0 after five 1s)
+        # Bit Stuffing Removal
         if bit == 0 and self.ones_in_row == 5:
             self.ones_in_row = 0
             return None
@@ -130,12 +119,11 @@ class AFSK1200Demodulator:
         if self.collecting:
             self.bit_buffer |= (bit << (self.bit_count))
             self.bit_count += 1
-            if self.bit_count == 8: # Byte full
+            if self.bit_count == 8: 
                 self.packet_buffer.append(self.bit_buffer)
                 self.bit_buffer = 0
                 self.bit_count = 0
-                # Sanity check for max length
-                if len(self.packet_buffer) > 300: 
+                if len(self.packet_buffer) > 500: 
                     self.collecting = False
                     self.packet_buffer = bytearray()
         return None
@@ -150,7 +138,7 @@ class APRSPacket:
         self.symbol_table = "/" 
         self.symbol_code = ">"  
         self.comment = ""
-        # Use UTC Time
+        # Store timestamp in UTC
         self.timestamp = datetime.datetime.now(datetime.timezone.utc)
         
         if raw_bytes:
@@ -164,7 +152,7 @@ class APRSPacket:
             self.callsign_src = self._decode_call(data[7:14])
             
             try:
-                # Find Control Field (0x03) and Protocol ID (0xF0)
+                # Find Control Field (0x03)
                 idx = data.index(b'\x03\xf0') 
                 self.payload = data[idx+2:].decode('latin-1', errors='replace')
                 self._parse_aprs_data(self.payload)
@@ -185,23 +173,39 @@ class APRSPacket:
         return call.strip()
 
     def _parse_aprs_data(self, info):
-        import re
-        # Regex for Coordinates and Symbols
-        pattern = re.compile(r'[\!=\/@](\d{4}\.\d{2})([NS])(.)(\d{5}\.\d{2})([EW])(.)')
-        match = pattern.search(info)
+        # Universal Regex for Position extraction
+        # (\d{4}\.\d{2}) -> Lat
+        # ([NS])         -> Dir
+        # (.)            -> Symbol Table ID
+        # (\d{5}\.\d{2}) -> Lon
+        # ([EW])         -> Dir
+        # (.)            -> Symbol Code
+        regex = r'(\d{4}\.\d{2})([NS])(.)(\d{5}\.\d{2})([EW])(.)'
+        match = re.search(regex, info)
+        
         if match:
             try:
                 lat_str, lat_dir, sym_table, lon_str, lon_dir, sym_code = match.groups()
                 
-                self.latitude = float(lat_str[:2]) + float(lat_str[2:])/60
+                # Convert Lat to Decimal
+                lat_deg = float(lat_str[:2])
+                lat_min = float(lat_str[2:])
+                self.latitude = lat_deg + (lat_min / 60.0)
                 if lat_dir == 'S': self.latitude *= -1
                 
-                self.longitude = float(lon_str[:3]) + float(lon_str[3:])/60
+                # Convert Lon to Decimal
+                lon_deg = float(lon_str[:3])
+                lon_min = float(lon_str[3:])
+                self.longitude = lon_deg + (lon_min / 60.0)
                 if lon_dir == 'W': self.longitude *= -1
                 
                 self.symbol_table = sym_table
                 self.symbol_code = sym_code
                 
-                parts = info.split(sym_code, 1)
-                if len(parts) > 1: self.comment = parts[1].strip()
+                # Extract comment (everything after the symbol)
+                end_pos = match.end()
+                if end_pos < len(info):
+                    self.comment = info[end_pos:].strip()
+                else:
+                    self.comment = info.strip()
             except: pass

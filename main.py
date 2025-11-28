@@ -25,7 +25,7 @@ class APRSApp:
         self.icon_mgr = IconManager()
         self.p = pyaudio.PyAudio()
         
-        # 2. State
+        # 2. App State
         self.is_running = False
         self.audio_queue = queue.Queue()
         self.markers = {}         
@@ -40,11 +40,11 @@ class APRSApp:
         # 3. Audio Devices
         self.audio_devices = self.get_audio_devices()
         
-        # 4. Build UI
+        # 4. Initialize UI
         self.setup_ui_structure()
         self.reload_ui()
         
-        # Force geometry to prevent collapse
+        # Geometry fix
         self.root.geometry("1200x900")
         self.root.update() 
 
@@ -69,11 +69,11 @@ class APRSApp:
         self.btn_sett = ttk.Button(self.toolbar, command=self.toggle_settings_view)
         self.btn_sett.pack(side=tk.RIGHT)
 
-        # --- CONTAINER ---
+        # --- Container ---
         self.container = ttk.Frame(self.root)
         self.container.pack(fill=tk.BOTH, expand=True)
         
-        # === VIEW 1: DASHBOARD ===
+        # === DASHBOARD VIEW ===
         self.view_dashboard = ttk.Frame(self.container)
         self.view_dashboard.pack(fill=tk.BOTH, expand=True)
         
@@ -83,28 +83,27 @@ class APRSApp:
         self.scope_canvas = tk.Canvas(self.scope_frame, height=120, highlightthickness=0)
         self.scope_canvas.pack(fill=tk.BOTH, expand=True)
 
-        # Split Pane
+        # Main Split
         self.paned = ttk.PanedWindow(self.view_dashboard, orient=tk.HORIZONTAL)
         self.paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
-        # --- LINKES PANEL ---
+        # Left Panel
         self.left_panel = ttk.Frame(self.paned, width=400)
         self.paned.add(self.left_panel, weight=1)
         
-        # 1. Audio Control
+        # Audio & Controls
         self.ctrl_group = ttk.LabelFrame(self.left_panel, padding=10)
         self.ctrl_group.pack(fill=tk.X, pady=(0, 5))
         
         self.device_combo = ttk.Combobox(self.ctrl_group)
         self.device_combo.pack(fill=tk.X, pady=5)
         
-        # 2. START/STOP BUTTON (WICHTIG: tk.Button für Farben!)
-        # Platziert direkt zwischen Audio und Log
+        # Start/Stop Button (tk.Button for color support)
         self.btn_start = tk.Button(self.left_panel, command=self.toggle_receiving, 
                                  bd=0, relief=tk.FLAT, cursor="hand2")
         self.btn_start.pack(fill=tk.X, pady=10, padx=2)
         
-        # 3. Log
+        # Log Table
         self.log_group = ttk.LabelFrame(self.left_panel, padding=2)
         self.log_group.pack(fill=tk.BOTH, expand=True)
         
@@ -119,7 +118,7 @@ class APRSApp:
         self.scrl.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.bind('<<TreeviewSelect>>', self.on_list_select)
         
-        # Map (Right)
+        # Right Panel (Map)
         self.map_container = ttk.LabelFrame(self.paned)
         self.paned.add(self.map_container, weight=3)
         self.map_widget = tkintermapview.TkinterMapView(self.map_container, corner_radius=0)
@@ -127,13 +126,12 @@ class APRSApp:
         self.map_widget.set_position(51.16, 10.45)
         self.map_widget.set_zoom(6)
         
-        # Status
+        # Status Bar
         self.lbl_status = tk.Label(self.view_dashboard, textvariable=self.status_var, bd=2, relief=tk.SUNKEN, anchor=tk.W, padx=5)
         self.lbl_status.pack(fill=tk.X, side=tk.BOTTOM, pady=5)
 
-        # === VIEW 2: SETTINGS (Hidden Overlay) ===
+        # === SETTINGS VIEW (Overlay) ===
         self.view_settings = ttk.Frame(self.container)
-        
         self.sett_box = ttk.Frame(self.view_settings, padding=20)
         self.sett_box.place(relx=0.5, rely=0.5, anchor="center", width=500, height=450)
         
@@ -158,7 +156,7 @@ class APRSApp:
         self.btn_close_sett.pack(pady=30, fill=tk.X)
 
     def reload_ui(self):
-        """Refreshes Colors, Texts and States"""
+        """Refreshes all visuals (Themes, Texts, Colors)"""
         self.style_cfg = self.settings.get_style()
         self.txt = self.settings.get_text
         cfg = self.style_cfg
@@ -168,6 +166,7 @@ class APRSApp:
         self.view_settings.configure(style="TFrame") 
         self.view_dashboard.configure(style="TFrame")
         
+        # Styles
         s = ttk.Style()
         try: s.theme_use(cfg["ttk_theme"])
         except: pass
@@ -182,6 +181,7 @@ class APRSApp:
         s.configure("Treeview.Heading", background=cfg["grid"], foreground=cfg["fg"], font=cfg["font_bold"])
         s.map("Treeview", background=[('selected', cfg["accent"])], foreground=[('selected', 'white')])
         
+        # Text Updates
         self.btn_save.config(text=self.txt("BTN_SAVE_LOG"))
         self.btn_sett.config(text=self.txt("BTN_SETTINGS"))
         self.btn_close_sett.config(text=self.txt("BTN_CLOSE_SETT"))
@@ -194,9 +194,7 @@ class APRSApp:
         self.log_group.config(text=self.txt("LOG_TITLE"))
         self.map_container.config(text=self.txt("MAP_TITLE"))
         
-        # --- UPDATE BUTTON FARBE & TEXT ---
-        # Wir nutzen Config Farben für konsistenten Look
-        # START = Grün (accent), STOP = Rot (warn)
+        # Main Button Color & Text
         if self.is_running:
             self.btn_start.config(
                 text=self.txt("STOP"), 
@@ -223,7 +221,7 @@ class APRSApp:
         self.lbl_status.config(bg=cfg["scope_bg"], fg=cfg["scope_fg"], font=cfg["font_bold"])
         self.map_widget.set_tile_server(cfg["map_server"])
         
-        # Populate Settings
+        # Populate Settings Dropdowns
         from settings import LANGUAGES, THEMES
         self.cb_lang['values'] = list(LANGUAGES.keys())
         self.cb_theme['values'] = list(THEMES.keys())
@@ -255,6 +253,7 @@ class APRSApp:
         self.reload_ui()
         self.view_settings.place_forget()
         
+        # Restart Audio if running
         if self.is_running:
             self.toggle_receiving() 
             self.root.after(500, self.toggle_receiving)
@@ -297,9 +296,6 @@ class APRSApp:
                 self.map_widget.set_position(m.position[0], m.position[1])
 
     def toggle_receiving(self):
-        # Config laden für Farben
-        cfg = self.style_cfg
-        
         if not self.is_running:
             try:
                 idx = self.settings.config.get("audio_device_index", 0)
@@ -308,7 +304,8 @@ class APRSApp:
                                         frames_per_buffer=4096, stream_callback=self.audio_callback)
                 self.is_running = True
                 
-                # --- UPDATE TO STOP (RED) ---
+                # Manual Button Update because it's not TTK
+                cfg = self.style_cfg
                 self.btn_start.config(
                     text=self.txt("STOP"), 
                     bg=cfg["warn"], 
@@ -327,7 +324,7 @@ class APRSApp:
                 self.stream.stop_stream()
                 self.stream.close()
             
-            # --- UPDATE TO START (GREEN) ---
+            cfg = self.style_cfg
             self.btn_start.config(
                 text=self.txt("START"), 
                 bg=cfg["accent"], 
@@ -389,22 +386,27 @@ class APRSApp:
         return bool(re.match(r'^[A-Z0-9]+(?:-[0-9]{1,2})?$', call))
 
     def on_marker_click(self, marker):
+        """Click event for map markers to show details"""
         try:
+            # 1. Reset previous marker to simple text
             if self.active_marker_call and self.active_marker_call in self.markers:
                 old_marker = self.markers[self.active_marker_call]
                 old_marker.set_text(self.active_marker_call)
 
+            # 2. Identify clicked marker
             clicked_call = None
             for call, m in self.markers.items():
                 if m == marker:
                     clicked_call = call
                     break
             
+            # 3. Show full details
             if clicked_call and clicked_call in self.marker_data:
                 full_info = self.marker_data[clicked_call]
                 marker.set_text(full_info)
                 self.active_marker_call = clicked_call
-        except: pass
+                
+        except Exception: pass
 
     def handle_packet(self, raw_bytes):
         try:
@@ -416,6 +418,7 @@ class APRSApp:
             info_short = info_full[:40] + "..." if len(info_full) > 40 else info_full
             time_str = pkt.timestamp.strftime('%H:%M:%S')
             
+            # Save data for Export
             self.log_data.append([
                 pkt.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
                 pkt.callsign_src,
@@ -425,6 +428,7 @@ class APRSApp:
                 info_full
             ])
             
+            # Add to List
             self.tree.insert('', 0, values=(
                 time_str, 
                 pkt.callsign_src, 
@@ -435,21 +439,26 @@ class APRSApp:
             if pkt.latitude and pkt.longitude:
                 call = pkt.callsign_src
                 
+                # History / Path
                 if call not in self.station_history: self.station_history[call] = []
                 self.station_history[call].append((pkt.latitude, pkt.longitude))
                 if len(self.station_history[call]) > 50: self.station_history[call].pop(0)
                 
+                # Details for Popup
                 full_details = f"{call}\n{info_full}\n{time_str} UTC"
                 self.marker_data[call] = full_details
 
                 icon_img = self.icon_mgr.get_icon(pkt.symbol_table, pkt.symbol_code, self.style_cfg["accent"])
                 
+                # Marker Logic
                 if call in self.markers:
                     self.markers[call].set_position(pkt.latitude, pkt.longitude)
+                    # Only update text if currently clicked/expanded
                     if self.active_marker_call == call:
                          self.markers[call].set_text(full_details)
                     else:
                          self.markers[call].set_text(call)
+                    
                     if icon_img: self.markers[call].set_icon(icon_img)
                 else:
                     m = self.map_widget.set_marker(

@@ -10,7 +10,7 @@ LANGUAGES = {
         "AUDIO_INPUT": "Audio Input Device",
         "START": "Start Receiver",
         "STOP": "Stop Receiver",
-        "STATUS_READY": "System Ready",
+        "STATUS_READY": "System Ready - Standby",
         "STATUS_LISTENING": "Listening on 144.800 MHz (UTC)",
         "SCOPE_TITLE": "Signal Analysis",
         "MAP_TITLE": "Tactical Map",
@@ -24,7 +24,8 @@ LANGUAGES = {
         "LBL_THEME": "Visual Theme:",
         "LBL_LANG": "Language:",
         "LBL_AUDIO": "Audio Device:",
-        "BTN_CLOSE_SETT": "Save & Close"
+        "BTN_CLOSE_SETT": "Save & Close",
+        "RESTART_MSG": "Settings saved."
     },
     "Deutsch": {
         "WINDOW_TITLE": "APRS DECODER - U96 EDITION",
@@ -45,7 +46,8 @@ LANGUAGES = {
         "LBL_THEME": "Design Thema:",
         "LBL_LANG": "Sprache:",
         "LBL_AUDIO": "Audio Gerät:",
-        "BTN_CLOSE_SETT": "Speichern & Schließen"
+        "BTN_CLOSE_SETT": "Speichern & Schließen",
+        "RESTART_MSG": "Einstellungen gespeichert."
     }
 }
 
@@ -91,7 +93,6 @@ class SettingsManager:
             try:
                 with open(CONFIG_FILE, "r") as f:
                     data = json.load(f)
-                    # Merge with defaults to prevent errors on new keys
                     default.update(data)
                     return default
             except:
