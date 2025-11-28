@@ -7,27 +7,28 @@ class AFSK1200Demodulator:
         self.fs = sample_rate
         self.baud = 1200.0
         
-        # --- ROBUSTER FILTER ENTWORF ---
-        # Statt extrem enger Filter nehmen wir einen breiten Bandpass.
-        # Das toleriert Frequenzabweichungen (z.B. wenn das Funkgerät nicht exakt auf Frequenz ist).
+        # --- ROBUST FILTER DESIGN ---
+        # Instead of narrow mark/space filters, we use a wide bandpass.
+        # This handles frequency drift better (e.g., poor radio calibration).
         
         # 1. Bandpass: 900Hz - 2500Hz
-        # Alles darunter (Brummen) und darüber (Rauschen) kommt weg.
+        # Removes low hum and high frequency noise.
         self.b_bp, self.a_bp = butter(4, [900, 2500], btype='band', fs=self.fs)
         
-        # 2. Tiefpass: 1200Hz (Glättung nach der Demodulation)
+        # 2. Lowpass: 1200Hz
+        # Post-detection filter to smooth the discriminator output.
         self.b_lp, self.a_lp = butter(4, 1200, btype='low', fs=self.fs)
         
-        # Filter Status (für nahtloses Audio)
+        # Filter States (to maintain continuity between audio chunks)
         self.zi_bp = np.zeros((max(len(self.a_bp), len(self.b_bp)) - 1, ))
         self.zi_lp = np.zeros((max(len(self.a_lp), len(self.b_lp)) - 1, ))
 
-        # PLL State
+        # PLL (Clock Recovery) State
         self.pll_phase = 0.0
         self.pll_step = self.baud / self.fs
         self.last_phase = 0
         
-        # Packet Buffer
+        # HDLC (Packet Assembly) State
         self.packet_buffer = bytearray()
         self.ones_in_row = 0
         self.collecting = False
@@ -36,62 +37,59 @@ class AFSK1200Demodulator:
         
     def process_chunk(self, audio_chunk):
         """
-        Nimmt Audio entgegen, filtert, demoduliert und gibt Pakete zurück.
+        Process audio chunk, demodulate and return parsed packets.
+        Returns: (List_of_Packet_Bytes, Demodulated_Signal_For_UI)
         """
-        # Sicherheitscheck: Leere Daten?
+        # Safety check for empty data
         if len(audio_chunk) == 0: 
             return [], np.zeros(100)
 
-        # 1. Normalisieren (verhindert Übersteuerung)
-        # Wir konvertieren zu Float (-1.0 bis 1.0)
+        # 1. Normalize (prevent clipping, convert to float -1.0 to 1.0)
         max_val = np.max(np.abs(audio_chunk))
         if max_val == 0: 
             return [], np.zeros(100)
             
         signal = audio_chunk / 32768.0
         
-        # 2. BANDPASS FILTER (Lärmschutz)
+        # 2. BANDPASS FILTER
         signal_filtered, self.zi_bp = lfilter(self.b_bp, self.a_bp, signal, zi=self.zi_bp)
         
-        # 3. HARD LIMITER (Der wichtigste Teil!)
-        # Egal wie leise oder laut: Wir machen daraus ein perfektes Rechtecksignal (+1/-1).
-        # Das hilft extrem bei schwachen Signalen.
+        # 3. HARD LIMITER (Crucial!)
+        # Converts everything to a square wave (+1/-1).
+        # Makes the decoder immune to volume fluctuations.
         signal_limited = np.sign(signal_filtered)
         
-        # 4. DISKRIMINATOR (Verzögerungsmultiplikation)
-        # Das ist der klassische FM-Demodulator. Er funktioniert, solange der
-        # Phasenunterschied zwischen 1200Hz und 2200Hz erkennbar ist.
+        # 4. DISCRIMINATOR (Delay-Line)
+        # Classic FM Demodulation by multiplying signal with delayed version.
         delayed = np.roll(signal_limited, 1)
         delayed[0] = 0 
         mixed = signal_limited * delayed
         
-        # 5. TIEFPASS FILTER (Glättung)
+        # 5. LOWPASS FILTER (Smoothing)
         demodulated, self.zi_lp = lfilter(self.b_lp, self.a_lp, mixed, zi=self.zi_lp)
         
-        # 6. BIT SLICING (Entscheidung: 0 oder 1?)
-        # Wir nehmen den Durchschnitt als Nullpunkt (DC Offset Removal)
+        # 6. BIT SLICING
+        # Use mean as threshold (DC Offset Removal)
         threshold = np.mean(demodulated)
         bits_digital = (demodulated > threshold).astype(int)
         
-        # 7. CLOCK RECOVERY & HDLC (Daten extrahieren)
+        # 7. CLOCK RECOVERY & HDLC
         packets = []
         for i in range(1, len(bits_digital)):
             self.pll_phase += self.pll_step
             
-            # Wenn sich der Bit-Wert ändert, synchronisieren wir unsere Uhr (PLL)
+            # Sync PLL on edge detection
             if bits_digital[i] != bits_digital[i-1]:
-                # Sanftes Nachjustieren (Nudging)
+                # Nudge PLL
                 if self.pll_phase < 0.5: self.pll_phase += 0.05
                 else: self.pll_phase -= 0.05
             
-            # Ist es Zeit, das Bit zu lesen?
+            # Sampling point
             if self.pll_phase >= 1.0:
                 self.pll_phase -= 1.0
                 sampled_bit = bits_digital[i]
                 
-                # NRZI Decoding: 
-                # Wenn sich das Signal ändert -> 0
-                # Wenn es gleich bleibt -> 1
+                # NRZI Decoding: Change = 0, No Change = 1
                 current_bit = 1 if sampled_bit == self.last_phase else 0
                 self.last_phase = sampled_bit
                 
@@ -101,11 +99,11 @@ class AFSK1200Demodulator:
         return packets, demodulated
 
     def _hdlc_process(self, bit):
-        # Erkennt den Start eines Pakets (01111110)
+        # Detect Flag (01111110)
         if bit == 0 and self.ones_in_row == 6: 
             result = None
-            if len(self.packet_buffer) > 14: # Mindestlänge für ein gültiges Paket
-                # Die letzten 2 Bytes sind CRC (Prüfsumme), die schneiden wir ab
+            if len(self.packet_buffer) > 14: # Min length for APRS
+                # Strip CRC (last 2 bytes)
                 result = bytes(self.packet_buffer[:-2]) 
             self.packet_buffer = bytearray()
             self.bit_buffer = 0
@@ -114,14 +112,14 @@ class AFSK1200Demodulator:
             self.collecting = True
             return result
             
-        # Bit Stuffing entfernen (eine 0 nach fünf 1en wird ignoriert)
+        # Remove Bit Stuffing (0 after five 1s)
         if bit == 0 and self.ones_in_row == 5:
             self.ones_in_row = 0
             return None
             
         if bit == 1:
             self.ones_in_row += 1
-            if self.ones_in_row > 6: # Fehler: Mehr als sechs 1en gibt es bei APRS nicht
+            if self.ones_in_row > 6: # Error / Abort
                 self.packet_buffer = bytearray()
                 self.collecting = False
                 self.ones_in_row = 0
@@ -132,11 +130,11 @@ class AFSK1200Demodulator:
         if self.collecting:
             self.bit_buffer |= (bit << (self.bit_count))
             self.bit_count += 1
-            if self.bit_count == 8: # Ein ganzes Byte voll
+            if self.bit_count == 8: # Byte full
                 self.packet_buffer.append(self.bit_buffer)
                 self.bit_buffer = 0
                 self.bit_count = 0
-                # Sicherheits-Reset bei zu langen Datenmüll-Paketen
+                # Sanity check for max length
                 if len(self.packet_buffer) > 300: 
                     self.collecting = False
                     self.packet_buffer = bytearray()
@@ -152,33 +150,30 @@ class APRSPacket:
         self.symbol_table = "/" 
         self.symbol_code = ">"  
         self.comment = ""
-        self.timestamp = datetime.datetime.now()
+        # Use UTC Time
+        self.timestamp = datetime.datetime.now(datetime.timezone.utc)
         
         if raw_bytes:
             self.parse_ax25(raw_bytes)
 
     def parse_ax25(self, data):
         try:
-            # AX.25 Header muss mindestens 14 Bytes sein (2 Adressen)
             if len(data) < 14: return
             
             self.callsign_dst = self._decode_call(data[0:7])
             self.callsign_src = self._decode_call(data[7:14])
             
             try:
-                # Suche nach dem Start der APRS-Daten (0x03 0xF0)
-                # Das ist das "Control Field" und "Protocol ID"
+                # Find Control Field (0x03) and Protocol ID (0xF0)
                 idx = data.index(b'\x03\xf0') 
                 self.payload = data[idx+2:].decode('latin-1', errors='replace')
                 self._parse_aprs_data(self.payload)
             except ValueError:
-                # Manchmal fehlen die Control Fields im Raw Mode (selten)
                 pass
         except Exception:
             pass
 
     def _decode_call(self, data):
-        # Rufzeichen decodieren (Bit-Shifted ASCII)
         call = ""
         try:
             ssid = (data[-1] >> 1) & 0x0F
@@ -191,8 +186,7 @@ class APRSPacket:
 
     def _parse_aprs_data(self, info):
         import re
-        # Extrahiert Koordinaten und Symbole
-        # Unterstützt verschiedene APRS Formate (!, =, /, @)
+        # Regex for Coordinates and Symbols
         pattern = re.compile(r'[\!=\/@](\d{4}\.\d{2})([NS])(.)(\d{5}\.\d{2})([EW])(.)')
         match = pattern.search(info)
         if match:
