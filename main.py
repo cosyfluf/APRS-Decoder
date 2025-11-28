@@ -6,121 +6,134 @@ import pyaudio
 import numpy as np
 import time
 import requests
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 import io
 import tkintermapview 
-import traceback # Für detaillierte Fehlermeldungen
+import traceback
+import re
 from datetime import datetime
 
-# Import der Logik
+# Importiere Module
 from decoder import AFSK1200Demodulator, APRSPacket
-
-# --- THEMA KONFIGURATION (DAS BOOT STYLE) ---
-COLOR_BG = "#121212"        
-COLOR_PANEL = "#1e1e1e"     
-COLOR_TEXT = "#33ff33"      
-COLOR_WARN = "#ff3333"      
-COLOR_ACCENT = "#00cc00"    
-COLOR_GRID = "#004400"      
-FONT_MAIN = ("Consolas", 10)
-FONT_BOLD = ("Consolas", 10, "bold")
-FONT_LCD = ("Consolas", 12, "bold")
+from settings import SettingsManager, SettingsWindow # Unser neues Script
 
 class IconManager:
     def __init__(self):
         self.cache = {}
         self.base_url = "https://raw.githubusercontent.com/hessu/aprs-symbols/master/symbols/24x24"
         self.symbol_map = {
-            '>': 'car', '[': 'jogger', '-': 'house', 'k': 'truck', 'v': 'van', 
-            'b': 'bike', 'u': 'truck', 's': 'ship', 'j': 'jeep', '<': 'motorcycle', 
-            'R': 'recreational', '#': 'digi', '*': 'star', 'S': 'shuttle', 
-            'O': 'balloon', 'a': 'ambulance', 'f': 'fire', 'y': 'yacht', '/': 'red_dot'
+            '>': 'car', 'k': 'truck', 'u': 'truck', 'v': 'van', 'b': 'bike', '<': 'motorcycle',
+            '[': 'jogger', '-': 'house', '#': 'digi', '*': 'star', 'S': 'shuttle', 
+            'O': 'balloon', 'a': 'ambulance', 'f': 'fire', 'y': 'yacht', 's': 'ship',
+            'j': 'jeep', 'R': 'recreational', '/': 'red_dot', '0': 'circle', '^': 'plane'
         }
 
-    def get_icon(self, table, code):
-        """Holt Icon sicher ab, ohne abzustürzen"""
-        try:
-            key = code
-            filename = self.symbol_map.get(key, 'unknown')
-            if table == '/' and code == '>': filename = 'car'
-            
-            if key in self.cache: return self.cache[key]
-            if filename == 'unknown': return None
-                
-            url = f"{self.base_url}/{filename}.png"
-            # Kurzer Timeout, damit GUI nicht einfriert
-            response = requests.get(url, timeout=0.5) 
-            if response.status_code == 200:
-                img_data = response.content
-                image = Image.open(io.BytesIO(img_data))
-                image = image.resize((32, 32), Image.Resampling.LANCZOS)
-                tk_image = ImageTk.PhotoImage(image)
-                self.cache[key] = tk_image
-                return tk_image
-        except Exception as e:
-            # Fehler beim Icon laden ignorieren wir stillschweigend
-            # damit der Rest weiterläuft
-            pass
-        return None
+    def create_fallback_icon(self, color):
+        size = 32
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse([2, 2, size-2, size-2], outline=color, width=2)
+        draw.ellipse([10, 10, size-10, size-10], fill=color)
+        return ImageTk.PhotoImage(image)
+
+    def get_icon(self, table, code, fallback_color):
+        key = f"{table}{code}"
+        if key in self.cache: return self.cache[key]
+        
+        filename = self.symbol_map.get(code)
+        tk_image = None
+        if filename:
+            try:
+                url = f"{self.base_url}/{filename}.png"
+                response = requests.get(url, timeout=0.5)
+                if response.status_code == 200:
+                    img_data = response.content
+                    image = Image.open(io.BytesIO(img_data)).convert("RGBA")
+                    image = image.resize((32, 32), Image.Resampling.LANCZOS)
+                    tk_image = ImageTk.PhotoImage(image)
+            except: pass
+
+        if tk_image is None:
+            tk_image = self.create_fallback_icon(fallback_color)
+        
+        self.cache[key] = tk_image
+        return tk_image
 
 class APRSApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("U96 SONAR DECODER - SYSTEM ACTIVE")
-        self.root.geometry("1200x900")
-        self.root.configure(bg=COLOR_BG)
         
-        self.setup_styles()
+        # 1. SETTINGS LADEN
+        self.settings = SettingsManager()
+        self.style_cfg = self.settings.get_style()
+        self.txt = self.settings.get_text
+        
+        self.root.title(self.txt("WINDOW_TITLE"))
+        self.root.geometry("1200x900")
+        self.root.configure(bg=self.style_cfg["bg"])
+        
+        # 2. THEME ANWENDEN
+        self.apply_theme()
         
         self.demod = AFSK1200Demodulator()
         self.icon_mgr = IconManager()
         self.p = pyaudio.PyAudio()
         self.is_running = False
         self.audio_queue = queue.Queue()
+        
         self.markers = {}
+        self.paths = {}
+        self.station_history = {}
         
         self.my_lat = tk.DoubleVar(value=50.11)
         self.my_lon = tk.DoubleVar(value=8.68)
-        self.status_var = tk.StringVar(value="SYSTEM BEREIT - WARTE AUF SIGNAL")
+        self.status_var = tk.StringVar(value=self.txt("STATUS_READY"))
         
         self.setup_ui()
         self.update_devices()
         
-    def setup_styles(self):
-        style = ttk.Style()
-        style.theme_use('clam')
+    def apply_theme(self):
+        """Konfiguriert ttk Styles basierend auf settings.py"""
+        s = ttk.Style()
+        try:
+            s.theme_use(self.style_cfg["ttk_theme"])
+        except:
+            s.theme_use('clam') # Fallback
+
+        cfg = self.style_cfg
         
-        style.configure(".", background=COLOR_BG, foreground=COLOR_TEXT, font=FONT_MAIN, borderwidth=1)
-        style.configure("TFrame", background=COLOR_BG)
-        style.configure("TLabelframe", background=COLOR_BG, bordercolor=COLOR_ACCENT)
-        style.configure("TLabelframe.Label", background=COLOR_BG, foreground=COLOR_ACCENT, font=FONT_BOLD)
+        s.configure(".", background=cfg["bg"], foreground=cfg["fg"], font=cfg["font"], borderwidth=1)
+        s.configure("TFrame", background=cfg["bg"])
+        s.configure("TLabelframe", background=cfg["bg"], bordercolor=cfg["accent"])
+        s.configure("TLabelframe.Label", background=cfg["bg"], foreground=cfg["accent"], font=cfg["font_bold"])
         
-        style.configure("TButton", background=COLOR_PANEL, foreground=COLOR_TEXT, borderwidth=2, bordercolor=COLOR_ACCENT)
-        style.map("TButton", background=[('active', COLOR_ACCENT)], foreground=[('active', 'black')])
+        s.configure("TButton", background=cfg["panel"], foreground=cfg["fg"], borderwidth=1)
+        s.map("TButton", background=[('active', cfg["accent"])], foreground=[('active', 'white')])
         
-        style.configure("TCombobox", fieldbackground=COLOR_PANEL, background=COLOR_PANEL, foreground=COLOR_TEXT, arrowcolor=COLOR_TEXT)
+        s.configure("TCombobox", fieldbackground=cfg["panel"], background=cfg["panel"], foreground=cfg["fg"])
         
-        # Treeview Style Fix
-        style.configure("Treeview", 
-                        background=COLOR_PANEL, 
-                        fieldbackground=COLOR_PANEL, 
-                        foreground=COLOR_TEXT, 
-                        borderwidth=0,
-                        font=FONT_MAIN)
-        style.configure("Treeview.Heading", 
-                        background="#002200", 
-                        foreground=COLOR_TEXT, 
-                        font=FONT_BOLD)
-        style.map("Treeview", background=[('selected', COLOR_ACCENT)], foreground=[('selected', 'black')])
+        s.configure("Treeview", background=cfg["panel"], fieldbackground=cfg["panel"], foreground=cfg["fg"], borderwidth=0, font=cfg["font"])
+        s.configure("Treeview.Heading", background=cfg["grid"], foreground=cfg["fg"], font=cfg["font_bold"])
+        s.map("Treeview", background=[('selected', cfg["accent"])], foreground=[('selected', 'white')])
         
-        style.configure("Vertical.TScrollbar", background=COLOR_PANEL, troughcolor=COLOR_BG, arrowcolor=COLOR_TEXT)
+        s.configure("Vertical.TScrollbar", background=cfg["panel"], troughcolor=cfg["bg"])
 
     def setup_ui(self):
+        cfg = self.style_cfg
+        
+        # --- Toolbar (Oben) ---
+        toolbar = ttk.Frame(self.root)
+        toolbar.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Settings Button
+        btn_sett = ttk.Button(toolbar, text=self.txt("BTN_SETTINGS"), command=self.open_settings)
+        btn_sett.pack(side=tk.RIGHT)
+
         # --- SCOPE ---
-        scope_frame = ttk.LabelFrame(self.root, text="/// HYDROPHONE SIGNAL ANALYSIS ///", padding=2)
+        scope_frame = ttk.LabelFrame(self.root, text=self.txt("SCOPE_TITLE"), padding=2)
         scope_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        self.scope_canvas = tk.Canvas(scope_frame, bg="black", height=150, highlightthickness=0)
+        self.scope_canvas = tk.Canvas(scope_frame, bg=cfg["scope_bg"], height=150, highlightthickness=0)
         self.scope_canvas.pack(fill=tk.BOTH, expand=True)
         self.draw_grid()
 
@@ -132,63 +145,68 @@ class APRSApp:
         left_panel = ttk.Frame(paned, width=400)
         paned.add(left_panel, weight=1)
         
-        ctrl_group = ttk.LabelFrame(left_panel, text="[ COMMUNICATION INPUT ]", padding=10)
+        ctrl_group = ttk.LabelFrame(left_panel, text=self.txt("AUDIO_INPUT"), padding=10)
         ctrl_group.pack(fill=tk.X, pady=(0, 10))
         
-        ttk.Label(ctrl_group, text="AUDIO DEVICE:").pack(anchor=tk.W)
         self.device_combo = ttk.Combobox(ctrl_group)
         self.device_combo.pack(fill=tk.X, pady=5)
         
-        self.btn_start = ttk.Button(ctrl_group, text="ACTIVATE RECEIVER", command=self.toggle_receiving)
+        self.btn_start = ttk.Button(ctrl_group, text=self.txt("START"), command=self.toggle_receiving)
         self.btn_start.pack(fill=tk.X, pady=5)
         
-        log_group = ttk.LabelFrame(left_panel, text="[ DECODED TELEMETRY ]", padding=2)
+        log_group = ttk.LabelFrame(left_panel, text=self.txt("LOG_TITLE"), padding=2)
         log_group.pack(fill=tk.BOTH, expand=True)
         
         cols = ("Time", "Call", "Sym", "Data")
         self.tree = ttk.Treeview(log_group, columns=cols, show='headings', selectmode='browse')
         
-        self.tree.heading("Time", text="UTC")
+        self.tree.heading("Time", text=self.txt("COL_TIME"))
         self.tree.column("Time", width=70, anchor="center")
-        self.tree.heading("Call", text="STATION")
+        self.tree.heading("Call", text=self.txt("COL_CALL"))
         self.tree.column("Call", width=90, anchor="w")
-        self.tree.heading("Sym", text="TYPE")
+        self.tree.heading("Sym", text=self.txt("COL_SYM"))
         self.tree.column("Sym", width=50, anchor="center")
-        self.tree.heading("Data", text="PAYLOAD")
+        self.tree.heading("Data", text=self.txt("COL_MSG"))
         
-        # Tag für Farbe definieren (Sicherheitsnetz)
-        self.tree.tag_configure('matrix', foreground=COLOR_TEXT, background=COLOR_PANEL)
+        self.tree.tag_configure('matrix', foreground=cfg["fg"], background=cfg["panel"])
         
         scrl = ttk.Scrollbar(log_group, command=self.tree.yview)
         self.tree.configure(yscroll=scrl.set)
-        
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrl.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.bind('<<TreeviewSelect>>', self.on_list_select)
         
         self.lbl_status = tk.Label(left_panel, textvariable=self.status_var, 
-                                 bg="black", fg=COLOR_TEXT, font=FONT_LCD, 
+                                 bg=cfg["scope_bg"], fg=cfg["scope_fg"], font=cfg["font_bold"], 
                                  bd=2, relief=tk.SUNKEN, anchor=tk.W, padx=5)
         self.lbl_status.pack(fill=tk.X, side=tk.BOTTOM, pady=5)
 
         # --- RECHTS ---
-        map_container = ttk.LabelFrame(paned, text="[ TACTICAL MAP DISPLAY ]")
+        map_container = ttk.LabelFrame(paned, text=self.txt("MAP_TITLE"))
         paned.add(map_container, weight=3)
         
         self.map_widget = tkintermapview.TkinterMapView(map_container, corner_radius=0)
         self.map_widget.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
-        self.map_widget.set_tile_server("https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png")
+        
+        # Karte basierend auf Theme
+        if "Windows" in self.settings.config["theme"]:
+            self.map_widget.set_tile_server("https://a.tile.openstreetmap.org/{z}/{x}/{y}.png") # Hell
+        else:
+            self.map_widget.set_tile_server("https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png") # Dunkel
+            
         self.map_widget.set_position(51.16, 10.45)
         self.map_widget.set_zoom(6)
+
+    def open_settings(self):
+        SettingsWindow(self.root, self.settings)
 
     def draw_grid(self):
         w = 1200 
         h = 150
-        self.scope_canvas.create_line(0, h/4, 2000, h/4, fill=COLOR_GRID, dash=(2, 4))
-        self.scope_canvas.create_line(0, h/2, 2000, h/2, fill=COLOR_ACCENT, width=1)
-        self.scope_canvas.create_line(0, 3*h/4, 2000, 3*h/4, fill=COLOR_GRID, dash=(2, 4))
-        self.scope_canvas.create_text(10, 10, text="AUDIO INPUT GAIN", fill=COLOR_TEXT, anchor="nw", font=("Consolas", 8))
-        self.scope_canvas.create_text(10, 80, text="MARK/SPACE CORRELATOR DELTA", fill=COLOR_WARN, anchor="nw", font=("Consolas", 8))
+        cfg = self.style_cfg
+        self.scope_canvas.create_line(0, h/4, 2000, h/4, fill=cfg["grid"], dash=(2, 4))
+        self.scope_canvas.create_line(0, h/2, 2000, h/2, fill=cfg["scope_line"], width=1)
+        self.scope_canvas.create_line(0, 3*h/4, 2000, 3*h/4, fill=cfg["grid"], dash=(2, 4))
 
     def update_devices(self):
         devs = []
@@ -211,67 +229,55 @@ class APRSApp:
     def toggle_receiving(self):
         if not self.is_running:
             try:
-                if not self.device_combo.get():
-                    messagebox.showerror("ERROR", "No Audio Device Selected!")
-                    return
-
+                if not self.device_combo.get(): return
                 idx = int(self.device_combo.get().split(':')[0])
                 self.stream = self.p.open(format=pyaudio.paInt16, channels=1, rate=22050,
                                         input=True, input_device_index=idx,
                                         frames_per_buffer=4096, stream_callback=self.audio_callback)
                 self.is_running = True
-                self.btn_start.config(text="TERMINATE RECEIVER")
-                self.status_var.set(">>> LISTENING ON 144.800 MHZ <<<")
-                
+                self.btn_start.config(text=self.txt("STOP"))
+                self.status_var.set(self.txt("STATUS_LISTENING"))
                 t = threading.Thread(target=self.processing_loop)
                 t.daemon = True
                 t.start()
             except Exception as e:
-                messagebox.showerror("SYSTEM FAILURE", str(e))
+                messagebox.showerror("Error", str(e))
         else:
             self.is_running = False
             if hasattr(self, 'stream'):
                 self.stream.stop_stream()
                 self.stream.close()
-            self.btn_start.config(text="ACTIVATE RECEIVER")
-            self.status_var.set("SYSTEM STANDBY")
+            self.btn_start.config(text=self.txt("START"))
+            self.status_var.set(self.txt("STATUS_READY"))
 
     def audio_callback(self, in_data, frame_count, time_info, status):
         if self.is_running: self.audio_queue.put(in_data)
         return (None, pyaudio.paContinue)
 
     def processing_loop(self):
-        """Haupt-Thread für Signalverarbeitung"""
         while self.is_running:
             try:
                 if not self.audio_queue.empty():
                     raw = self.audio_queue.get()
                     chunk = np.frombuffer(raw, dtype=np.int16)
-                    
-                    # Hier passiert die Magie
                     packets_bytes, viz_data = self.demod.process_chunk(chunk)
                     
-                    # Scope Update
                     if np.max(np.abs(chunk)) > 800:
                         self.root.after(0, self.draw_scope, chunk, viz_data)
                     
-                    # Wenn wir Pakete haben, ab zur GUI
                     for pkt_bytes in packets_bytes:
-                        print(f"DEBUG: Paket erkannt! Bytes: {len(pkt_bytes)}") # Debugging
                         self.root.after(0, self.handle_packet, pkt_bytes)
                 else:
                     time.sleep(0.01)
-            except Exception as e:
-                print("DSP ERROR:", e)
-                traceback.print_exc() # Zeigt den genauen Fehler im Terminal
+            except: pass
 
     def draw_scope(self, audio, demod):
         w = self.scope_canvas.winfo_width()
         h = self.scope_canvas.winfo_height()
         if w < 10: return
-        
         self.scope_canvas.delete("wave")
         
+        cfg = self.style_cfg
         step = max(1, len(audio) // w)
         mid1 = h / 4
         mid2 = (h / 4) * 3
@@ -282,7 +288,7 @@ class APRSApp:
             y = mid1 - (audio[i] / 30000.0) * (h/4)
             pts1.extend([x, y])
         if len(pts1) > 4: 
-            self.scope_canvas.create_line(pts1, fill=COLOR_TEXT, tags="wave", width=1)
+            self.scope_canvas.create_line(pts1, fill=cfg["scope_fg"], tags="wave", width=1)
         
         pts2 = []
         scale = np.max(np.abs(demod)) or 1
@@ -291,28 +297,21 @@ class APRSApp:
             y = mid2 - (demod[i] / scale) * (h/4)
             pts2.extend([x, y])
         if len(pts2) > 4: 
-            self.scope_canvas.create_line(pts2, fill=COLOR_WARN, tags="wave", width=2)
+            self.scope_canvas.create_line(pts2, fill=cfg["warn"], tags="wave", width=2)
+
+    def is_valid_callsign(self, call):
+        if not call: return False
+        return bool(re.match(r'^[A-Z0-9]+(?:-[0-9]{1,2})?$', call))
 
     def handle_packet(self, raw_bytes):
-        """Wird im GUI Thread aufgerufen, wenn ein Paket da ist"""
         try:
             pkt = APRSPacket(raw_bytes)
-            
-            # Kein gültiges Callsign? Ignorieren.
-            if not pkt.callsign_src: 
-                print("DEBUG: Paket ohne gültiges Callsign verworfen.")
-                return
-            
-            print(f"DEBUG: Valid Packet from {pkt.callsign_src}")
-            self.status_var.set(f"CONTACT DETECTED: {pkt.callsign_src}")
-            
-            # Icon holen (mit Error Handling intern)
-            icon_img = self.icon_mgr.get_icon(pkt.symbol_table, pkt.symbol_code)
+            if not pkt.callsign_src: return
+            if not self.is_valid_callsign(pkt.callsign_src): return
             
             info = pkt.comment or pkt.payload
-            if len(info) > 40: info = info[:40] + "..."
+            info = info[:40] + "..." if len(info) > 40 else info
             
-            # Einfügen in Log mit Tag 'matrix'
             self.tree.insert('', 0, values=(
                 pkt.timestamp.strftime('%H:%M:%S'), 
                 pkt.callsign_src, 
@@ -320,21 +319,32 @@ class APRSApp:
                 info
             ), tags=('matrix',))
             
-            # Karte updaten
             if pkt.latitude and pkt.longitude:
                 call = pkt.callsign_src
+                if call not in self.station_history: self.station_history[call] = []
+                self.station_history[call].append((pkt.latitude, pkt.longitude))
+                if len(self.station_history[call]) > 50: self.station_history[call].pop(0)
+                
+                icon_img = self.icon_mgr.get_icon(pkt.symbol_table, pkt.symbol_code, self.style_cfg["accent"])
+                marker_text = f"{call}\n{info}"
+                
                 if call in self.markers:
                     self.markers[call].set_position(pkt.latitude, pkt.longitude)
+                    self.markers[call].set_text(marker_text)
                     if icon_img: self.markers[call].set_icon(icon_img)
                 else:
                     if icon_img:
-                        m = self.map_widget.set_marker(pkt.latitude, pkt.longitude, text=call, icon=icon_img)
+                        m = self.map_widget.set_marker(pkt.latitude, pkt.longitude, text=marker_text, icon=icon_img, text_color=self.style_cfg["fg"])
                     else:
-                        m = self.map_widget.set_marker(pkt.latitude, pkt.longitude, text=call)
+                        m = self.map_widget.set_marker(pkt.latitude, pkt.longitude, text=marker_text, text_color=self.style_cfg["fg"])
                     self.markers[call] = m
-        except Exception as e:
-            print("GUI ERROR in handle_packet:", e)
-            traceback.print_exc()
+                
+                if len(self.station_history[call]) > 1:
+                    if call in self.paths:
+                        self.paths[call].set_position_list(self.station_history[call])
+                    else:
+                        self.paths[call] = self.map_widget.set_path(self.station_history[call], color=self.style_cfg["accent"], width=2)
+        except: pass
 
 if __name__ == "__main__":
     root = tk.Tk()
