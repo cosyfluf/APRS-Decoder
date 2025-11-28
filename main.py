@@ -4,254 +4,224 @@ import threading
 import queue
 import pyaudio
 import numpy as np
-from decoder import APRSParser, AFSKDemodulator
-from map import MapManager
+import time
+import math
+import os
+from datetime import datetime
 
-class APRSDecoderApp:
+# Importiere unsere Module
+from decoder import AFSK1200Demodulator, APRSPacket
+from map import MapServer
+
+class LogManager:
+    """Verwaltet CSV und ADIF Logs"""
+    def __init__(self):
+        date_str = datetime.now().strftime('%Y%m%d')
+        self.csv_file = f"aprs_log_{date_str}.csv"
+        self.adif_file = f"aprs_log_{date_str}.adi"
+        
+        if not os.path.exists(self.csv_file):
+            with open(self.csv_file, 'w') as f:
+                f.write("Date,Time,Callsign,Lat,Lon,Distance_km,Comment\n")
+        
+        if not os.path.exists(self.adif_file):
+            with open(self.adif_file, 'w') as f:
+                f.write("APRS Live Log ADIF Export\n<EOH>\n")
+
+    def log(self, packet, my_lat, my_lon):
+        if not packet.callsign_src: return 0.0
+        
+        # Distanz berechnen
+        dist_km = 0.0
+        if my_lat and my_lon and packet.latitude:
+            R = 6371
+            dlat = math.radians(packet.latitude - my_lat)
+            dlon = math.radians(packet.longitude - my_lon)
+            a = math.sin(dlat/2)**2 + math.cos(math.radians(my_lat)) * \
+                math.cos(math.radians(packet.latitude)) * math.sin(dlon/2)**2
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+            dist_km = R * c
+
+        # CSV schreiben
+        with open(self.csv_file, 'a') as f:
+            f.write(f"{packet.timestamp.date()},{packet.timestamp.strftime('%H:%M:%S')},"
+                    f"{packet.callsign_src},{packet.latitude:.4f},{packet.longitude:.4f},"
+                    f"{dist_km:.1f},\"{packet.comment}\"\n")
+        
+        # ADIF schreiben
+        with open(self.adif_file, 'a') as f:
+            call = packet.callsign_src
+            date_s = packet.timestamp.strftime('%Y%m%d')
+            time_s = packet.timestamp.strftime('%H%M')
+            record = (f"<CALL:{len(call)}>{call} <QSO_DATE:{len(date_s)}>{date_s} "
+                      f"<TIME_ON:{len(time_s)}>{time_s} <MODE:3>PKT <BAND:2>2m "
+                      f"<COMMENT:{len(packet.comment)}>{packet.comment} <EOR>\n")
+            f.write(record)
+            
+        return dist_km
+
+class APRSApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("APRS Live Decoder")
-        self.root.geometry("1000x700")
+        self.root.title("Python APRS Decoder (Real DSP)")
+        self.root.geometry("900x600")
         
-        # Komponenten initialisieren
-        self.map_manager = MapManager()
-        self.parser = APRSParser()
-        self.demodulator = AFSKDemodulator()
+        # Backend-Objekte
+        self.demod = AFSK1200Demodulator()
+        self.map_server = MapServer()
+        self.logger = LogManager()
+        
+        # Server starten
+        self.map_server.start()
         
         # Audio Variablen
-        self.audio = None
-        self.stream = None
-        self.is_recording = False
+        self.is_running = False
         self.audio_queue = queue.Queue()
+        self.p = pyaudio.PyAudio()
         
+        # GUI Setup
         self.setup_ui()
-        self.setup_audio_devices()
-        
+        self.update_devices()
+
     def setup_ui(self):
-        # Haupt-Layout
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # 1. Kopfzeile (Steuerung)
+        ctrl_frame = ttk.Frame(self.root, padding=5)
+        ctrl_frame.pack(fill=tk.X)
         
-        # Linke Seite: Einstellungen und Log
-        left_frame = ttk.Frame(main_frame)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ttk.Label(ctrl_frame, text="Audio Input:").pack(side=tk.LEFT)
+        self.device_combo = ttk.Combobox(ctrl_frame, width=40)
+        self.device_combo.pack(side=tk.LEFT, padx=5)
         
-        # Rechte Seite: Karte
-        right_frame = ttk.Frame(main_frame)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        self.btn_start = ttk.Button(ctrl_frame, text="Start Empfang", command=self.toggle_receiving)
+        self.btn_start.pack(side=tk.LEFT, padx=5)
         
-        # Einstellungen Frame
-        settings_frame = ttk.LabelFrame(left_frame, text="Audio Einstellungen", padding=10)
-        settings_frame.pack(fill=tk.X, pady=(0, 10))
+        ttk.Button(ctrl_frame, text="Karte öffnen", command=self.map_server.open_browser).pack(side=tk.LEFT, padx=5)
         
-        # Audio Device Auswahl
-        ttk.Label(settings_frame, text="Eingabegerät:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
-        self.device_var = tk.StringVar()
-        self.device_combo = ttk.Combobox(settings_frame, textvariable=self.device_var, width=40)
-        self.device_combo.grid(row=0, column=1, sticky=tk.EW, padx=(0, 10))
+        # 2. QTH Einstellungen (für Distanz)
+        qth_frame = ttk.LabelFrame(self.root, text="Mein Standort (für QRB Berechnung)", padding=5)
+        qth_frame.pack(fill=tk.X, padx=5)
         
-        # Sample Rate
-        ttk.Label(settings_frame, text="Sample Rate:").grid(row=1, column=0, sticky=tk.W, padx=(0, 10))
-        self.rate_var = tk.StringVar(value="22050")
-        rate_combo = ttk.Combobox(settings_frame, textvariable=self.rate_var, 
-                                 values=["8000", "11025", "22050", "44100"])
-        rate_combo.grid(row=1, column=1, sticky=tk.W, padx=(0, 10))
+        self.my_lat = tk.DoubleVar(value=50.11)
+        self.my_lon = tk.DoubleVar(value=8.68)
         
-        # Control Buttons
-        button_frame = ttk.Frame(settings_frame)
-        button_frame.grid(row=2, column=0, columnspan=2, pady=10)
+        ttk.Label(qth_frame, text="Lat:").pack(side=tk.LEFT)
+        ttk.Entry(qth_frame, textvariable=self.my_lat, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(qth_frame, text="Lon:").pack(side=tk.LEFT)
+        ttk.Entry(qth_frame, textvariable=self.my_lon, width=10).pack(side=tk.LEFT, padx=5)
         
-        self.start_btn = ttk.Button(button_frame, text="Start", command=self.start_decoding)
-        self.start_btn.pack(side=tk.LEFT, padx=(0, 10))
+        # 3. Tabelle
+        tree_frame = ttk.Frame(self.root)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        self.stop_btn = ttk.Button(button_frame, text="Stop", command=self.stop_decoding, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT)
+        cols = ("Zeit", "Rufzeichen", "QRB (km)", "Kommentar / Info")
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show='headings')
         
-        # Status Anzeige
-        status_frame = ttk.Frame(settings_frame)
-        status_frame.grid(row=3, column=0, columnspan=2, sticky=tk.EW)
+        self.tree.heading("Zeit", text="Zeit")
+        self.tree.column("Zeit", width=80)
+        self.tree.heading("Rufzeichen", text="Rufzeichen")
+        self.tree.column("Rufzeichen", width=100)
+        self.tree.heading("QRB (km)", text="QRB (km)")
+        self.tree.column("QRB (km)", width=80)
+        self.tree.heading("Kommentar / Info", text="Kommentar / Info")
+        self.tree.column("Kommentar / Info", width=400)
         
-        self.status_var = tk.StringVar(value="Bereit")
-        ttk.Label(status_frame, textvariable=self.status_var).pack(side=tk.LEFT)
+        scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscroll=scroll.set)
         
-        self.station_count_var = tk.StringVar(value="Stationen: 0")
-        ttk.Label(status_frame, textvariable=self.station_count_var).pack(side=tk.RIGHT)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Log Frame
-        log_frame = ttk.LabelFrame(left_frame, text="APRS Log", padding=10)
-        log_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Log Text mit Scrollbar
-        log_text_frame = ttk.Frame(log_frame)
-        log_text_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.log_text = tk.Text(log_text_frame, height=15, wrap=tk.WORD)
-        scrollbar = ttk.Scrollbar(log_text_frame, command=self.log_text.yview)
-        self.log_text.config(yscrollcommand=scrollbar.set)
-        
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Karte Frame
-        map_frame = ttk.LabelFrame(right_frame, text="APRS Karte", padding=10)
-        map_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.map_widget = self.map_manager.get_map_widget(map_frame)
-        self.map_widget.pack(fill=tk.BOTH, expand=True)
-        
-        # Map Control Buttons
-        map_control_frame = ttk.Frame(map_frame)
-        map_control_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        ttk.Button(map_control_frame, text="Karte zurücksetzen", 
-                  command=self.map_manager.clear_all_stations).pack(side=tk.LEFT, padx=(0, 10))
-        
-        ttk.Button(map_control_frame, text="Karte im Browser öffnen", 
-                  command=self.map_manager.open_in_browser).pack(side=tk.LEFT)
-        
-    def setup_audio_devices(self):
-        """Audio Eingabegeräte ermitteln"""
-        try:
-            self.audio = pyaudio.PyAudio()
-            devices = []
-            for i in range(self.audio.get_device_count()):
-                device_info = self.audio.get_device_info_by_index(i)
-                if device_info['maxInputChannels'] > 0:
-                    devices.append(f"{i}: {device_info['name']}")
-            
-            self.device_combo['values'] = devices
-            if devices:
-                self.device_combo.current(0)
-        except Exception as e:
-            self.log(f"Fehler bei Audio-Initialisierung: {e}")
-            
-    def start_decoding(self):
-        """Startet die APRS Decodierung"""
-        if not self.device_var.get():
-            messagebox.showerror("Fehler", "Bitte ein Audio-Eingabegerät auswählen!")
-            return
-            
-        try:
-            device_index = int(self.device_var.get().split(':')[0])
-            sample_rate = int(self.rate_var.get())
-            
-            self.is_recording = True
-            self.start_btn.config(state=tk.DISABLED)
-            self.stop_btn.config(state=tk.NORMAL)
-            self.status_var.set("Empfange...")
-            
-            # Audio Stream starten
-            self.stream = self.audio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=sample_rate,
-                input=True,
-                input_device_index=device_index,
-                frames_per_buffer=1024,
-                stream_callback=self.audio_callback
-            )
-            
-            self.stream.start_stream()
-            
-            # Processing Thread starten
-            self.processing_thread = threading.Thread(target=self.process_audio_data)
-            self.processing_thread.daemon = True
-            self.processing_thread.start()
-            
-            self.log("APRS Decodierung gestartet")
-            
-        except Exception as e:
-            self.log(f"Fehler beim Start: {e}")
-            self.stop_decoding()
-            
-    def stop_decoding(self):
-        """Stoppt die APRS Decodierung"""
-        self.is_recording = False
-        self.status_var.set("Gestoppt")
-        
-        if self.stream:
+        # 4. Raw Log (unten)
+        self.raw_text = tk.Text(self.root, height=5, bg='black', fg='#00ff00', font=('Consolas', 9))
+        self.raw_text.pack(fill=tk.X, padx=5, pady=5)
+
+    def update_devices(self):
+        devices = []
+        for i in range(self.p.get_device_count()):
+            dev = self.p.get_device_info_by_index(i)
+            if dev['maxInputChannels'] > 0:
+                devices.append(f"{i}: {dev['name']}")
+        self.device_combo['values'] = devices
+        if devices: self.device_combo.current(0)
+
+    def toggle_receiving(self):
+        if not self.is_running:
+            try:
+                dev_index = int(self.device_combo.get().split(':')[0])
+                self.stream = self.p.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=22050,
+                    input=True,
+                    input_device_index=dev_index,
+                    frames_per_buffer=2048,
+                    stream_callback=self.audio_callback
+                )
+                self.is_running = True
+                self.btn_start.config(text="Stop Empfang")
+                
+                # Processing Thread starten
+                self.proc_thread = threading.Thread(target=self.processing_loop)
+                self.proc_thread.daemon = True
+                self.proc_thread.start()
+                
+            except Exception as e:
+                messagebox.showerror("Fehler", str(e))
+        else:
+            self.is_running = False
             self.stream.stop_stream()
             self.stream.close()
-            
-        self.start_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
-        self.log("APRS Decodierung gestoppt")
-        
+            self.btn_start.config(text="Start Empfang")
+
     def audio_callback(self, in_data, frame_count, time_info, status):
-        """Audio Callback für PyAudio"""
-        if self.is_recording:
+        if self.is_running:
             self.audio_queue.put(in_data)
-        return (in_data, pyaudio.paContinue)
-    
-    def process_audio_data(self):
-        """Verarbeitet Audio-Daten im separaten Thread"""
-        while self.is_recording:
+        return (None, pyaudio.paContinue)
+
+    def processing_loop(self):
+        while self.is_running:
             try:
                 if not self.audio_queue.empty():
-                    audio_data = self.audio_queue.get()
+                    raw_data = self.audio_queue.get()
+                    audio_chunk = np.frombuffer(raw_data, dtype=np.int16)
                     
-                    # Audio-Daten zu numpy array konvertieren
-                    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                    # Demodulieren
+                    packets = self.demod.process_chunk(audio_chunk)
                     
-                    # AFSK Demodulation (vereinfacht)
-                    decoded_data = self.demodulator.process_audio(audio_array)
-                    
-                    if decoded_data:
-                        # APRS Paket parsen
-                        packet = self.parser.parse_packet(decoded_data)
-                        
-                        if packet and packet.callsign:
-                            # UI updaten im Haupt-Thread
-                            self.root.after(0, self.update_ui, packet)
-                            
+                    for pkt_bytes in packets:
+                        # UI Update muss im Main Thread passieren
+                        self.root.after(0, self.handle_packet, pkt_bytes)
+                else:
+                    time.sleep(0.01)
             except Exception as e:
-                self.root.after(0, self.log, f"Verarbeitungsfehler: {e}")
-                
-    def update_ui(self, packet):
-        """Aktualisiert die UI mit neuen Paket-Daten"""
+                print(e)
+
+    def handle_packet(self, raw_bytes):
+        # Raw Anzeige
         try:
-            # Log Eintrag
-            log_entry = f"{packet.callsign}"
-            if packet.latitude and packet.longitude:
-                log_entry += f" @ {packet.latitude:.4f}, {packet.longitude:.4f}"
-            if packet.comment:
-                log_entry += f" - {packet.comment}"
-                
-            self.log(log_entry)
-            
-            # Auf Karte anzeigen
-            if packet.latitude and packet.longitude:
-                self.map_manager.add_station(
-                    packet.callsign,
-                    packet.latitude,
-                    packet.longitude,
-                    packet.symbol,
-                    packet.comment or ""
-                )
-                
-                # Stationszähler aktualisieren
-                count = self.map_manager.get_station_count()
-                self.station_count_var.set(f"Stationen: {count}")
-                
-        except Exception as e:
-            self.log(f"UI Update Fehler: {e}")
-            
-    def log(self, message):
-        """Fügt einen Eintrag zum Log hinzu"""
-        self.log_text.insert(tk.END, f"{message}\n")
-        self.log_text.see(tk.END)
-        self.log_text.update()
+            self.raw_text.insert(tk.END, f"{raw_bytes}\n")
+            self.raw_text.see(tk.END)
+        except: pass
         
-    def on_closing(self):
-        """Wird aufgerufen wenn das Fenster geschlossen wird"""
-        self.stop_decoding()
-        if self.audio:
-            self.audio.terminate()
-        self.root.destroy()
+        # Decodieren
+        packet = APRSPacket(raw_bytes)
+        
+        if packet.callsign_src:
+            # Logging & Distanz
+            dist = self.logger.log(packet, self.my_lat.get(), self.my_lon.get())
+            
+            # Map Update
+            self.map_server.update_station(packet)
+            
+            # Tabelle Update
+            self.tree.insert('', 0, values=(
+                packet.timestamp.strftime('%H:%M:%S'),
+                packet.callsign_src,
+                f"{dist:.1f}",
+                packet.comment
+            ))
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = APRSDecoderApp(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    root.mainloop()
+    app = APRSApp(root)
     root.mainloop()
